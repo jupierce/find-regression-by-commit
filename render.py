@@ -13,11 +13,17 @@ for csv_path in pathlib.Path('tests').glob('*metal*.csv'):
 
     df['local_pass_rate'] = df['success_count'] / (df['success_count'] + df['fail_count'])
 
+    def get_labels():
+        labels = []
+        for row in df.itertuples():
+            labels.append(row.first_release_date + '-' + row.tag_commit_id[:7])
+        return labels
+
     p = df.plot(ax=ax, x='tag_commit_id', y=['pass_rate', 'local_pass_rate'], figsize=(20, 10), picker=tolerance, color=['g', 'y'])
     p2 = df.plot(ax=ax2, x='tag_commit_id', y=['unique_prowjobs'], figsize=(20, 10), picker=tolerance)
     ax.set_xticks(
         ticks=range(len(df['tag_commit_id'])),
-        labels=df['tag_commit_id'],
+        labels=get_labels(),
         rotation='vertical')
     ax.set_ylim([0, 1])
     #ax2.set_ylim([0, 1])

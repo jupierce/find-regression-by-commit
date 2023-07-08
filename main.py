@@ -9,6 +9,7 @@ from fast_fisher import fast_fisher_cython
 import matplotlib.pyplot as plt
 import pathlib
 
+
 class WrappedInteger():
     def __init__(self, value=0):
         self._value = int(value)
@@ -74,31 +75,70 @@ if __name__ == '__main__':
 
     # LIMITING TO AMD64 for now! See WHERE CLAUSE
     QUERY = '''
-WITH payload_components AS(
-WITH commits AS(
-SELECT created_at, JSON_VALUE(payload,'$.ref' ) as branch, CONCAT("github.com/", repo.name) as repo, JSON_VALUE(payload,'$.head' ) as head, JSON_VALUE(payload,'$.before' ) as before   FROM `githubarchive.day.2*` 
-WHERE type = "PushEvent" 
-AND (_TABLE_SUFFIX LIKE "02306%" or _TABLE_SUFFIX LIKE "02307%")
-AND (repo.name LIKE "operator-framework/%" OR repo.name LIKE "openshift/%") 
-AND ENDS_WITH(JSON_VALUE(payload,'$.ref' ), "/master")
-) SELECT prowjob_build_id, tag_source_location, tag_commit_id, ANY_VALUE(release_name), MIN(release_created) as first_release_date, created_at FROM openshift-gce-devel.ci_analysis_us.job_releases jr JOIN commits ON commits.head = jr.tag_commit_id GROUP BY prowjob_build_id, tag_source_location, tag_commit_id, created_at
-)
-SELECT COUNT(DISTINCT junit.prowjob_build_id) AS unique_prowjobs, network, platform, arch, upgrade, test_id, ANY_VALUE(test_name) as test_name, tag_source_location, tag_commit_id, first_release_date, MIN(created_at) as committed_at, (COUNT(*)-SUM(success_val)-SUM(flake_count)) as fail_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-# SELECT COUNT(DISTINCT junit.prowjob_build_id) AS unique_prowjobs, "" as network, "" as platform, arch, "" as upgrade, test_id, ANY_VALUE(test_name) as test_name, tag_source_location, tag_commit_id, MIN(created_at) as committed_at, (COUNT(*)-SUM(success_val)-SUM(flake_count)) as fail_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-FROM `openshift-gce-devel.ci_analysis_us.junit` junit CROSS JOIN payload_components 
-WHERE junit.prowjob_build_id = payload_components.prowjob_build_id
-AND arch = 'amd64'
-AND platform LIKE "%metal%"
-AND junit.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
-GROUP BY network, platform, arch, upgrade, test_id, tag_source_location,tag_commit_id, first_release_date
-# GROUP BY arch, test_id, tag_source_location, tag_commit_id, first_release_date
-# ORDER BY MIN(created_at) DESC    
-ORDER BY first_release_date DESC    
+        WITH junit_all AS (
+            WITH payload_components AS(
+                WITH commits AS(
+                    SELECT  created_at, 
+                            JSON_VALUE(payload,'$.ref' ) as branch, 
+                            CONCAT("github.com/", repo.name) as repo, 
+                            JSON_VALUE(payload,'$.head' ) as head, 
+                            JSON_VALUE(payload,'$.before' ) as before   
+                    FROM `githubarchive.day.2*` 
+                    WHERE   type = "PushEvent" 
+                            AND (_TABLE_SUFFIX LIKE "02306%" or _TABLE_SUFFIX LIKE "02307%")
+                            AND (repo.name LIKE "operator-framework/%" OR repo.name LIKE "openshift/%") 
+                            AND ENDS_WITH(JSON_VALUE(payload,'$.ref' ), "/master")
+                ) 
+                SELECT  prowjob_build_id as pjbi, 
+                        tag_source_location, 
+                        tag_commit_id, 
+                        ANY_VALUE(release_name), 
+                        MIN(release_created) as first_release_date, 
+                        created_at 
+                FROM openshift-gce-devel.ci_analysis_us.job_releases jr JOIN commits ON commits.head = jr.tag_commit_id 
+                GROUP BY prowjob_build_id, tag_source_location, tag_commit_id, created_at
+            )
+            SELECT  *
+            FROM `openshift-gce-devel.ci_analysis_us.junit` junit CROSS JOIN payload_components 
+            WHERE   junit.prowjob_build_id = payload_components.pjbi
+                    AND arch = 'amd64'
+                    AND platform LIKE "%metal%"
+                    AND junit.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
+            
+            UNION ALL    
+            
+            SELECT  *
+            FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr CROSS JOIN payload_components 
+            WHERE   junit_pr.prowjob_build_id = payload_components.pjbi
+                    AND arch = 'amd64'
+                    AND platform LIKE "%metal%"
+                    AND junit_pr.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
+        )
+        # SELECT * FROM junit_all LIMIT 100
+        SELECT  COUNT(DISTINCT junit_all.prowjob_build_id) AS unique_prowjobs, 
+                network, 
+                platform, 
+                arch, 
+                upgrade, 
+                test_id, 
+                ANY_VALUE(test_name) as test_name, 
+                tag_source_location, 
+                tag_commit_id, 
+                MIN(first_release_date) as first_release_date, 
+                MIN(created_at) as committed_at, 
+                (COUNT(*)-SUM(success_val)-SUM(flake_count)) as fail_count, 
+                SUM(success_val) as success_count, 
+                SUM(flake_count) as flake_count
+        FROM junit_all
+        GROUP BY network, platform, arch, upgrade, test_id, tag_source_location,tag_commit_id
     '''
 
     df = client.query(QUERY).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
-
-    df = df[df['unique_prowjobs'] > 10]
+    print(f'Found {len(df.index)} rows..')
+    print('Sorting')
+    df.sort_values(by=['committed_at'], ascending=False, inplace=True)
+    print('Filtering')
+    #df = df[df['unique_prowjobs'] > 10]
 
     col_success_acc: List[int] = list()
     col_failure_acc: List[int] = list()
@@ -153,7 +193,7 @@ ORDER BY first_release_date DESC
                                             failure_acc_before, success_acc_before,
                                             alternative='greater')
         col_p.append(p)
-        if before_pass_rate - pass_rate > 0.05:
+        if before_pass_rate - pass_rate > 0.05 and row.unique_prowjobs > 10:
             regressed_test_uids.add(c.uid())
         counter += 1
         if counter % 100000 == 0:
