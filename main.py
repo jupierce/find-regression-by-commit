@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import NamedTuple, List
 
 import matplotlib.pyplot
+import pandas
 from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
 import matplotlib.pyplot as plt
@@ -116,7 +117,7 @@ if __name__ == '__main__':
                 FROM openshift-gce-devel.ci_analysis_us.job_releases jr
                 WHERE   release_created BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
                         AND release_name LIKE "4.14.%"   
-                        AND tag_source_location LIKE "%cluster-storage-operator%"             
+                        # AND tag_source_location LIKE "%cluster-storage-operator%"             
                 GROUP BY prowjob_build_id, tag_source_location, tag_commit_id
             )
             
@@ -200,6 +201,8 @@ if __name__ == '__main__':
     print(f'Processing {len(df.index)} rows..')
 
     grouped = df.groupby(['tag_source_location', 'test_id'])
+    groups_dataframes = list()
+    source_locations = set()
     for name, group in grouped:
         look_success: List[int] = list()
         look_failure: List[int] = list()
@@ -236,14 +239,34 @@ if __name__ == '__main__':
                     output_to_csv = True
                 group.at[idx, f'fe{look_size}'] = fe
 
+        tag_source_location = group.iloc[0]['tag_source_location']
         if output_to_csv:
-            tag_source_location = group.iloc[0]['tag_source_location']
             test_id = group.iloc[0]['test_id']
             org, repo = tag_source_location.split('/')[-2:]
-            orgdir = pathlib.Path(f'assessments/{org}/{repo}')
+            orgdir = pathlib.Path(f'repos/{org}/{repo}')
             orgdir.mkdir(exist_ok=True, parents=True)
             repo_out = orgdir.joinpath(f'{test_id}.csv')
             group.to_csv(str(repo_out))
+
+        if tag_source_location not in source_locations:
+            print(f'Processing: {tag_source_location}')
+            source_locations.add(tag_source_location)
+
+        groups_dataframes.append(group)
+
+    # Combine all the processed groups into a single dataframe.
+    analyzed_df = pandas.concat(groups_dataframes, axis=0, join='outer')
+    analyzed_df.sort_values('first_release_date', ascending=False, inplace=True)
+
+    grouped = analyzed_df.groupby('test_id')
+    for name, group in grouped:
+        if len(group.loc[(group['fe10'] > 0.95) | (group['fe20'] > 0.95) | (group['fe30'] > 0.95)]) > 0:
+            test_id = group.iloc[0]['test_id']
+            # There are statistically significant entries in for this test_id
+            testsdir = pathlib.Path(f'tests/')
+            testsdir.mkdir(exist_ok=True, parents=True)
+            test_out = testsdir.joinpath(f'{test_id}.csv')
+            group.to_csv(str(test_out))
 
     exit(0)
 
