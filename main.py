@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from collections import defaultdict
-from typing import NamedTuple, List
+from typing import NamedTuple, List, Dict
 
 import matplotlib.pyplot
 import pandas
@@ -35,28 +35,20 @@ class WrappedInteger:
 client = bigquery.Client(project='openshift-gce-devel')
 
 
-class Coordinate(NamedTuple):
-    network: str
-    upgrade: str
-    platform: str
-    arch: str
-    test_id: str
-    source_location: str
-
-    def uid(self):
-        return f'{self.network}-{self.upgrade}-{self.arch}-{self.platform}-{self.test_id}'
-
-
-success_sums = defaultdict(WrappedInteger)
-failure_sums = defaultdict(WrappedInteger)
-flake_sums = defaultdict(WrappedInteger)
-
-
 class ResultSum:
-    def __init__(self, success_count=0, failure_count=0, flake_count=0):
+
+    def __init__(self, max_records: int, success_count=0, failure_count=0):
+        self.max_records = max_records
         self.success_count = success_count
         self.failure_count = failure_count
-        self.flake_count = flake_count
+
+    def add_success(self):
+        if self.success_count + self.failure_count < self.max_records:
+            self.success_count += 1
+
+    def add_failure(self, amount=1):
+        if self.success_count + self.failure_count < self.max_records:
+            self.failure_count += amount
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
@@ -66,7 +58,7 @@ class ResultSum:
     def fishers_exact_regressed(self, result_sum2) -> float:
         # If at least ten tests have run including this commit and
         # if we have regressed at least 10% relative to the result we are comparing to.
-        if self.success_count + self.failure_count > 10 and result_sum2.pass_rate() - self.pass_rate() > 0.10:
+        if result_sum2.pass_rate() - self.pass_rate() > 0.10:
             return 1 - fast_fisher_cython.fisher_exact(
                 self.failure_count, self.success_count,
                 result_sum2.failure_count, result_sum2.success_count,
@@ -77,267 +69,235 @@ class ResultSum:
     def __str__(self):
         return f'[s={self.success_count} f={self.failure_count} r={int(self.pass_rate() * 100)}%]'
 
+
+MAX_WINDOW_SIZE = 30
+
+
+class CommitSums:
+
+    def __init__(self, source_location:str, commit_id: str, parent_commit_sums=None, child_commit_sums=None):
+        self.source_location = source_location
+        self.commit_id = commit_id
+        self.success_count = 0
+        self.failure_count = 0
+        self.flake_count = 0
+        self.parent = parent_commit_sums
+        self.child = child_commit_sums
+
+        self.ahead_10: ResultSum = ResultSum(10)
+        self.ahead_20: ResultSum = ResultSum(20)
+        self.ahead_30: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+
+        self.behind_10: ResultSum = ResultSum(10)
+        self.behind_20: ResultSum = ResultSum(20)
+        self.behind_30: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+
+    def add_success(self):
+
+        # Inform children of a success behind them
+        node = self.child
+        count = 0
+        while node is not None and count <= MAX_WINDOW_SIZE:
+            node.behind_10.add_success()
+            node.behind_20.add_success()
+            node.behind_30.add_success()
+            node = node.child
+            count += 1
+
+        # Inform parents and self of a success ahead of them
+        node = self
+        count = 0
+        while node is not None and count <= MAX_WINDOW_SIZE:
+            node.ahead_10.add_success()
+            node.ahead_20.add_success()
+            node.ahead_30.add_success()
+            node = node.parent
+            count += 1
+
+    def add_failure(self, amount=1):
+        if amount == 0:  # possible when decrementing flake_count and flake_count=0
+            return
+
+        # Inform children of a failure behind them
+        node = self.child
+        count = 0
+        while node is not None and count <= MAX_WINDOW_SIZE:
+            node.behind_10.add_failure(amount)
+            node.behind_20.add_failure(amount)
+            node.behind_30.add_failure(amount)
+            node = node.child
+            count += 1
+
+        # Inform parents and self of a failure ahead of them
+        node = self
+        count = 0
+        while node is not None and count <= MAX_WINDOW_SIZE:
+            node.ahead_10.add_failure(amount)
+            node.ahead_20.add_failure(amount)
+            node.ahead_30.add_failure(amount)
+            node = node.parent
+            count += 1
+
+    def fe10(self):
+        return self.ahead_10.fishers_exact_regressed(self.behind_10)
+
+    def fe20(self):
+        return self.ahead_20.fishers_exact_regressed(self.behind_20)
+
+    def fe30(self):
+        return self.ahead_30.fishers_exact_regressed(self.behind_30)
+
+    def __str__(self):
+        v = f'''Commit: {self.source_location}/commit/{self.commit_id}
+10:
+  behind10: {self.behind_10}        
+  ahead10: {self.ahead_10}
+  fe10: {self.fe10()}
+20:
+  behind10: {self.behind_20}        
+  ahead10: {self.ahead_20}
+  fe20: {self.fe20()}
+30:
+  behind30: {self.behind_30}        
+  ahead30: {self.ahead_30}
+  fe30: {self.fe30()}
+'''
+        if self.parent:
+            v += f'Parent: {self.parent.commit_id}\n'
+        if self.child:
+            v += f'Child: {self.child.commit_id}\n'
+        return v
+
+
+SourceLocation = str
+CommitId = str
+
 if __name__ == '__main__':
-    # QUERY = 'SELECT * FROM `openshift-gce-devel.ci_analysis_us.tmp_results_by_commit` ORDER BY first_instance_time DESC'
-
-    # Full granularity
-#     QUERY = '''
-# SELECT MIN(modified_time) as first_instance_time, junit.network, junit.upgrade, junit.platform, junit.arch, test_id, (COUNT(*)-SUM(success_val)-SUM(flake_count)) as fail_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count, tag_source_location, tag_commit_id FROM `openshift-gce-devel.ci_analysis_us.junit` junit, `openshift-gce-devel.ci_analysis_us.job_releases` job_releases
-# WHERE
-# junit.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 48 HOUR) AND CURRENT_DATETIME()
-# AND job_releases.prowjob_build_id = junit.prowjob_build_id
-# GROUP BY junit.network, junit.platform, junit.arch, junit.upgrade, test_id, job_releases.tag_source_location, job_releases.tag_commit_id
-# ORDER BY first_instance_time DESC
-#     '''
-
-    # QUERY = '''
-    # SELECT MIN(modified_time) as first_instance_time, "" as network, "" as upgrade, "" as platform, "" as arch, test_id, (COUNT(*)-SUM(success_val)-SUM(flake_count)) as fail_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count, tag_source_location, tag_commit_id FROM `openshift-gce-devel.ci_analysis_us.junit` junit, `openshift-gce-devel.ci_analysis_us.job_releases` job_releases
-    # WHERE
-    # junit.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 48 HOUR) AND CURRENT_DATETIME()
-    # AND job_releases.tag_commit_id != ""
-    # AND job_releases.prowjob_build_id = junit.prowjob_build_id
-    # GROUP BY test_id, job_releases.tag_source_location, job_releases.tag_commit_id
-    # ORDER BY first_instance_time DESC
-    # '''
 
     repos = pathlib.Path('payload-repos.txt').read_text().strip().splitlines()
     repos_csv = ','.join([f'"{repo}"' for repo in repos])  # "openshift/repo","openshift/repo2"
 
     # LIMITING TO AMD64 for now! See WHERE CLAUSE
     QUERY = f'''
-        WITH junit_all AS (
+        WITH junit_all AS(
             WITH payload_components AS(               
                 # Find all prowjobs which have run against a 4.14 payload commit
                 # in the last two months. 
                 SELECT  prowjob_build_id as pjbi, 
-                        tag_source_location, 
-                        tag_commit_id, 
+                        ARRAY_AGG(tag_source_location) as source_locations, 
+                        ARRAY_AGG(tag_commit_id) as commits, 
                         ANY_VALUE(release_name), 
                         MIN(release_created) as first_release_date, 
                 FROM openshift-gce-devel.ci_analysis_us.job_releases jr
                 WHERE   release_created BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
                         AND release_name LIKE "4.14.%"   
                         # AND tag_source_location LIKE "%cluster-storage-operator%"             
-                GROUP BY prowjob_build_id, tag_source_location, tag_commit_id
+                GROUP BY prowjob_build_id
             )
             
             # Find all junit tests run in non-PR triggered tests which ran as part of those prowjobs over the last two months
             SELECT  *
-            FROM `openshift-gce-devel.ci_analysis_us.junit` junit CROSS JOIN payload_components 
-            WHERE   junit.prowjob_build_id = payload_components.pjbi
-                    AND arch = 'amd64'
-                    AND platform LIKE "%metal%"
+            FROM `openshift-gce-devel.ci_analysis_us.junit` junit JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
+            WHERE   arch = 'amd64'
+                    AND platform LIKE "%metal-ipi%"
+                    AND network = "sdn"
                     AND junit.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
-            
+                    AND test_id LIKE "%cb921b4a3fa31e83daa90cc418bb1cbc%"
             UNION ALL    
             
             # Find all junit tests run in PR triggered tests which ran as part of those prowjobs over the last two months
             SELECT  *
-            FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr CROSS JOIN payload_components 
-            WHERE   junit_pr.prowjob_build_id = payload_components.pjbi
-                    AND arch = 'amd64'
-                    AND platform LIKE "%metal%"
+            FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi 
+            WHERE   arch = 'amd64'
+                    AND platform LIKE "%metal-ipi%"
+                    AND network = "sdn"
                     AND junit_pr.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
+                    AND test_id LIKE "%cb921b4a3fa31e83daa90cc418bb1cbc%"
         )
         
-        SELECT  COUNT(DISTINCT junit_all.prowjob_build_id) AS unique_prowjobs, 
-                ANY_VALUE(network), 
-                ANY_VALUE(platform), 
-                ANY_VALUE(arch), 
-                ANY_VALUE(upgrade), 
-                test_id, 
-                ANY_VALUE(test_name) as test_name, 
-                tag_source_location, 
-                tag_commit_id, 
-                MIN(first_release_date) as first_release_date, 
-                (COUNT(*)-SUM(success_val)-SUM(flake_count)) as fail_count, 
-                SUM(success_val) as success_count, 
-                SUM(flake_count) as flake_count
+        SELECT  *
         FROM junit_all
-        GROUP BY    #network, 
-                    #platform, 
-                    #arch, 
-                    #upgrade,    
-                    test_id, 
-                    tag_source_location, 
-                    tag_commit_id
-        # TODO: We want the records ordered by commit date. This is an imperfect approximation
-        # because not all commits are represented by the source_commit in a CI payload and
-        # nightly payload. The payload constructed for PR testing seems to have branch names
-        # instead of commit shas. 
-        # This means commit A could merge followed by commit B. Because of debound in the
-        # release controller, it could decide to test B for the CI payload, but the ART
-        # builds might update nightlies with commit A. In this case, our simple sort 
-        # here would come to conclude that B precedes A, which is false. In practice,
-        # this should be rare.
-        ORDER BY first_release_date DESC   
+        # TODO: We want the records ordered by commit date. This is an imperfect approximation.
+        ORDER BY modified_time ASC
     '''
 
     df = client.query(QUERY).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
     print(f'Found {len(df.index)} rows..')
 
-    lookahead_10_row: ResultSum = ResultSum()
-    lookbehind_10_row: ResultSum = ResultSum()
+    grouped_by_test_id = df.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'])
+    for name, group in grouped_by_test_id:
+        print(f'Processing {name}')
 
-    lookahead_20_row: ResultSum = ResultSum()
-    lookbehind_20_row: ResultSum = ResultSum()
+        linked_commits: Dict[SourceLocation, CommitSums] = dict()
+        all_commits: Dict[CommitId, CommitSums] = dict()
 
-    lookahead_30_row: ResultSum = ResultSum()
-    lookbehind_30_row: ResultSum = ResultSum()
+        first_row = group.iloc[0]
+        qtest_id = f"{first_row['network']}_{first_row['upgrade']}_{first_row['arch']}_{first_row['platform']}_{first_row['test_id']}"
 
-    # Initialize columns we will be populating during the scan
-    df['lookahead10'] = ResultSum()
-    df['lookbehind10'] = ResultSum()
-    df['fe10'] = 0.0
+        # First, establish the commit order for each source repo (approximate until TODO of querying github)
+        for t in group.itertuples():
+            source_locations = t.source_locations
+            commits = t.commits
+            for idx in range(len(commits)):
+                source_location = source_locations[idx]
+                commit_id = commits[idx]
+                if source_location not in linked_commits:
+                    new_commit = CommitSums(source_location, commit_id)  # Initial commit found for repo
+                    linked_commits[source_location] = new_commit
+                    all_commits[new_commit.commit_id] = new_commit
+                else:
+                    if commit_id not in all_commits:
+                        new_commit = CommitSums(source_location, commit_id, parent_commit_sums=linked_commits[source_location])
+                        linked_commits[source_location].child = new_commit
+                        linked_commits[source_location] = new_commit
+                        all_commits[new_commit.commit_id] = new_commit
 
-    df['lookahead20'] = ResultSum()
-    df['lookbehind20'] = ResultSum()
-    df['fe20'] = 0.0
+        for t in group.itertuples():
+            source_locations = t.source_locations
+            commits = t.commits
+            for idx in range(len(commits)):
+                commit_id = commits[idx]
+                target_commit = all_commits[commit_id]
+                if t.success_val == 1:
+                    target_commit.add_success()
+                else:
+                    target_commit.add_failure()
+                target_commit.add_failure(-1 * t.flake_count)
 
-    df['lookahead30'] = ResultSum()
-    df['lookbehind30'] = ResultSum()
-    df['fe30'] = 0.0
+        group_frame = pandas.DataFrame(columns=[
+            'modified_time',
+            'tag_commit_id',
+            'link',
+            'fe10',
+            'fe20',
+            'fe30',
+            'test_id'
+        ])
+        gf_idx = 0
 
-    print(f'Processing {len(df.index)} rows..')
+        for t in group.itertuples():
+            source_locations = t.source_locations
+            commits = t.commits
+            for idx in range(len(commits)):
+                commit_id = commits[idx]
+                if commit_id in all_commits:
+                    source_location = source_locations[idx]
+                    target_commit = all_commits[commit_id]
+                    group_frame.loc[gf_idx] = [
+                        t.modified_time,
+                        commit_id,
+                        f'{source_location}/commit/{commit_id}',
+                        target_commit.fe10(),
+                        target_commit.fe20(),
+                        target_commit.fe30(),
+                        qtest_id
+                    ]
+                    gf_idx += 1
+                    del all_commits[commit_id]  # Don't add this commit to table again
 
-    grouped = df.groupby(['tag_source_location', 'test_id'])
-    groups_dataframes = list()
-    source_locations = set()
-    for name, group in grouped:
-        look_success: List[int] = list()
-        look_failure: List[int] = list()
-        look_flake: List[int] = list()
-
-        for idx, row in group.iterrows():
-            look_success.append(row['success_count'])
-            look_failure.append(row['fail_count'])
-            look_flake.append(row['flake_count'])
-
-            for look_size in (10, 20, 30):
-                group.at[idx, f'lookahead{look_size}'] = ResultSum(
-                    success_count=sum(look_success[-1 * look_size:]),
-                    failure_count=sum(look_failure[-1 * look_size:]),
-                    flake_count=sum(look_flake[-1 * look_size:]),
-                )
-
-        for idx, row in group.iterrows():
-            look_success.pop(0)
-            look_failure.pop(0)
-            look_flake.pop(0)
-            for look_size in (10, 20, 30):
-                group.at[idx, f'lookbehind{look_size}'] = ResultSum(
-                    success_count=sum(look_success[0:look_size]),
-                    failure_count=sum(look_failure[0:look_size]),
-                    flake_count=sum(look_flake[0:look_size]),
-                )
-
-        output_to_csv = False
-        for idx, row in group.iterrows():
-            for look_size in (10, 20, 30):
-                fe = row[f'lookahead{look_size}'].fishers_exact_regressed(row[f'lookbehind{look_size}'])
-                if fe > 0.95:
-                    output_to_csv = True
-                group.at[idx, f'fe{look_size}'] = fe
-
-        tag_source_location = group.iloc[0]['tag_source_location']
-        if output_to_csv:
-            test_id = group.iloc[0]['test_id']
-            org, repo = tag_source_location.split('/')[-2:]
-            orgdir = pathlib.Path(f'repos/{org}/{repo}')
-            orgdir.mkdir(exist_ok=True, parents=True)
-            repo_out = orgdir.joinpath(f'{test_id}.csv')
-            group.to_csv(str(repo_out))
-
-        if tag_source_location not in source_locations:
-            print(f'Processing: {tag_source_location}')
-            source_locations.add(tag_source_location)
-
-        groups_dataframes.append(group)
-
-    # Combine all the processed groups into a single dataframe.
-    analyzed_df = pandas.concat(groups_dataframes, axis=0, join='outer')
-    analyzed_df.sort_values('first_release_date', ascending=False, inplace=True)
-
-    grouped = analyzed_df.groupby('test_id')
-    for name, group in grouped:
-        if len(group.loc[(group['fe10'] > 0.95) | (group['fe20'] > 0.95) | (group['fe30'] > 0.95)]) > 0:
-            test_id = group.iloc[0]['test_id']
-            # There are statistically significant entries in for this test_id
-            testsdir = pathlib.Path(f'tests/')
-            testsdir.mkdir(exist_ok=True, parents=True)
-            test_out = testsdir.joinpath(f'{test_id}.csv')
-            group.to_csv(str(test_out))
-
-    exit(0)
-
-
-    col_p = list()
-    col_failure_acc_before = list()
-    col_success_acc_before = list()
-    col_pass_rate = list()
-    col_highlight = list()
-    col_local_pass_rate = list()
-    col_before_pass_rate = list()
-    col_uids = list()
-
-    regressed_test_uids = set()
-
-    print(f'\nPhase 2...')
-    counter = 0
-    for row in df.itertuples():
-        c = Coordinate(network=row.network, upgrade=row.upgrade, platform=row.platform, arch=row.arch, test_id=row.test_id, source_location=row.tag_source_location)
-        success_acc_before = success_sums[c].dec(row.success_count)
-        failure_acc_before = failure_sums[c].dec(row.fail_count)
-        before_pass_rate = 0
-        if success_acc_before + failure_acc_before > 0:
-            before_pass_rate = success_acc_before / (success_acc_before + failure_acc_before)
-
-        col_local_pass_rate.append(row.success_count / (row.success_count + row.fail_count))
-
-        col_before_pass_rate.append(before_pass_rate)
-        col_failure_acc_before.append(failure_acc_before)
-        col_success_acc_before.append(success_acc_before)
-        pass_rate = row.success_acc / (row.failure_acc + row.success_acc)
-        col_pass_rate.append(pass_rate)
-        col_uids.append(c.uid())
-        p = fast_fisher_cython.fisher_exact(row.failure_acc, row.success_acc,
-                                            failure_acc_before, success_acc_before,
-                                            alternative='greater')
-        col_p.append(p)
-        if before_pass_rate - pass_rate > 0.05 and row.unique_prowjobs > 10:
-            regressed_test_uids.add(c.uid())
-            col_highlight.append('HERE')
-        else:
-            col_highlight.append('_')
-        counter += 1
-        if counter % 100000 == 0:
-            print(f'{counter // 100000}', end=' ')
-
-    df['failure_before'] = col_failure_acc_before
-    df['success_before'] = col_success_acc_before
-    df['pass_rate'] = col_pass_rate
-    df['before_pass_rate'] = col_before_pass_rate
-    df['local_pass_rate'] = col_local_pass_rate
-    df['hl'] = col_highlight
-    df['uid'] = col_uids
-    df['p'] = col_p
-    # df = df[df['p'] < 0.05]
-
-    pathlib.Path('tests').mkdir(parents=True, exist_ok=True)
-    print(f'\nFound {len(regressed_test_uids)} regressed tests')
-    for uid in regressed_test_uids:
-        test_id_records = df.loc[df['uid'] == uid]
-        test_id_records.to_csv(f'tests/{uid}.csv', index=False)
-
-    # for uid in regressed_test_uids:
-    #     test_id_records = df.loc[df['uid'] == uid]
-    #     p = test_id_records.plot(x='tag_commit_id', y=['pass_rate'])
-    #     plt.xticks(ticks=range(len(test_id_records['tag_commit_id'])),
-    #                labels=test_id_records['tag_commit_id'],
-    #                rotation='vertical')
-    #     plt.tight_layout()
-    #     plt.savefig(f'tests/{uid}.png', dpi=200)
-    #     print(f'wrote {uid}.png')
-    #     matplotlib.pyplot.close()
-
-
+        if len(group_frame.loc[(group_frame['fe10'] > 0.95) | (group_frame['fe20'] > 0.95) | (group_frame['fe30'] > 0.95)].index) > 10:
+            group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 3)
+            group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 2)
+            pathlib.Path('tests').mkdir(parents=True, exist_ok=True)
+            group_frame.to_csv(f'tests/{qtest_id}.csv')
+            print(group_frame.to_string())

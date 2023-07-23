@@ -8,7 +8,6 @@ get_labels_last_release_date = ''
 for csv_path in pathlib.Path('tests').glob('**/*cb921b4a3fa31e83daa90cc418bb1cbc*.csv'):
     print(f'Loading {csv_path}')
     df = pandas.read_csv(str(csv_path))
-    df.sort_values('first_release_date', ascending=False, inplace=True)
     filename_base = str(csv_path)[0:-4]
 
     df['include'] = 0
@@ -19,8 +18,8 @@ for csv_path in pathlib.Path('tests').glob('**/*cb921b4a3fa31e83daa90cc418bb1cbc
                 df.at[idx, 'include'] = 1
 
     #print(df.to_string())
-    df = df[df['include'] == 1]
-    df = df.iloc[::-1]  # Reverse the order of the rows so that time moves left to right
+    # df = df[df['include'] == 1]
+    # df = df.iloc[::-1]  # Reverse the order of the rows so that time moves left to right
     print(df.to_string())
 
     fig, ax = plt.subplots()
@@ -42,11 +41,11 @@ for csv_path in pathlib.Path('tests').glob('**/*cb921b4a3fa31e83daa90cc418bb1cbc
         ticks=range(len(df['tag_commit_id'])),
         labels=get_labels(),
         rotation='vertical')
-    ax.set_ylim([0, 1])
+    ax.set_ylim([0, 3.05])
 
     plt.tight_layout()
     plt.grid(visible=True, axis='x')
-    plt.title(df.iloc[0]['test_name'])
+    plt.title(df.iloc[0]['test_id'])
     plt.savefig(f'{filename_base}.png')
     print(f'wrote {filename_base}.png')
 
