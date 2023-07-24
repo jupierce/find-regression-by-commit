@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-
+import multiprocessing
 from collections import defaultdict
 from typing import NamedTuple, List, Dict
+import time
+import tqdm
 
 import matplotlib.pyplot
 import pandas
@@ -32,9 +34,6 @@ class WrappedInteger:
         return self._value
 
 
-client = bigquery.Client(project='openshift-gce-devel')
-
-
 class ResultSum:
 
     def __init__(self, max_records: int, success_count=0, failure_count=0):
@@ -49,6 +48,9 @@ class ResultSum:
     def add_failure(self, amount=1):
         if self.success_count + self.failure_count < self.max_records:
             self.failure_count += amount
+            if self.failure_count < 0:
+                # This can happen if we hit a flake_count > row, but datetime aligns us after the rows of the failures they account for.
+                self.failure_count = 0
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
@@ -63,7 +65,6 @@ class ResultSum:
                 self.failure_count, self.success_count,
                 result_sum2.failure_count, result_sum2.success_count,
                 alternative='greater')
-
         return 0.0
 
     def __str__(self):
@@ -172,69 +173,82 @@ class CommitSums:
 SourceLocation = str
 CommitId = str
 
-if __name__ == '__main__':
+SCAN_PERIOD = 'BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 WEEK) AND CURRENT_DATETIME()'
+# SCAN_PERIOD = 'BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 1 MONTH) AND CURRENT_DATETIME()'
+LIMIT_ARCH = 'amd64'
+LIMIT_NETWORK = 'ovn'
+LIMIT_TEST_ID = None
+# LIMIT_TEST_ID = ['openshift-tests:cb921b4a3fa31e83daa90cc418bb1cbc']
 
-    repos = pathlib.Path('payload-repos.txt').read_text().strip().splitlines()
-    repos_csv = ','.join([f'"{repo}"' for repo in repos])  # "openshift/repo","openshift/repo2"
 
-    # LIMITING TO AMD64 for now! See WHERE CLAUSE
+def analyze_test_id(test_id):
+
     QUERY = f'''
         WITH junit_all AS(
+            
+            # Find 4.14 prowjobs which tested payloads during the scan period. For each
+            # payload, aggregate the commits it included into an array.
             WITH payload_components AS(               
                 # Find all prowjobs which have run against a 4.14 payload commit
                 # in the last two months. 
                 SELECT  prowjob_build_id as pjbi, 
                         ARRAY_AGG(tag_source_location) as source_locations, 
                         ARRAY_AGG(tag_commit_id) as commits, 
-                        ANY_VALUE(release_name), 
-                        MIN(release_created) as first_release_date, 
+                        ANY_VALUE(release_name) as release_name, 
+                        ANY_VALUE(release_created) as release_created 
                 FROM openshift-gce-devel.ci_analysis_us.job_releases jr
-                WHERE   release_created BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
-                        AND release_name LIKE "4.14.%"   
-                        # AND tag_source_location LIKE "%cluster-storage-operator%"             
+                WHERE   release_created {SCAN_PERIOD}
+                        # TODO: THIS ONLY INCLUDES NIGHTLIES AT PRESENT. INCLUDE CI PAYLOADS LATER
+                        AND release_name LIKE "4.14.0-0.nightly%"   
                 GROUP BY prowjob_build_id
             )
-            
+
             # Find all junit tests run in non-PR triggered tests which ran as part of those prowjobs over the last two months
             SELECT  *
-            FROM `openshift-gce-devel.ci_analysis_us.junit` junit JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
-            WHERE   arch = 'amd64'
-                    AND platform LIKE "%metal-ipi%"
-                    AND network = "sdn"
-                    AND junit.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
-                    AND test_id LIKE "%cb921b4a3fa31e83daa90cc418bb1cbc%"
-            UNION ALL    
+            FROM `openshift-gce-devel.ci_analysis_us.junit` junit INNER JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
+            WHERE   arch LIKE "{LIMIT_ARCH}"
+                    AND network LIKE "{LIMIT_NETWORK}"
+                    AND junit.modified_time {SCAN_PERIOD}
+                    AND test_id = "{test_id}"
             
-            # Find all junit tests run in PR triggered tests which ran as part of those prowjobs over the last two months
-            SELECT  *
-            FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi 
-            WHERE   arch = 'amd64'
-                    AND platform LIKE "%metal-ipi%"
-                    AND network = "sdn"
-                    AND junit_pr.modified_time BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 MONTH) AND CURRENT_DATETIME()
-                    AND test_id LIKE "%cb921b4a3fa31e83daa90cc418bb1cbc%"
+            # IGNORE TESTING FROM PRs for the time being.
+            # UNION ALL    
+
+            # # Find all junit tests run in PR triggered tests which ran as part of those prowjobs over the last two months
+            # SELECT  *
+            # FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr INNER JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi 
+            # WHERE   arch LIKE "{LIMIT_ARCH}"
+            #         AND network LIKE "{LIMIT_NETWORK}"
+            #         AND junit_pr.modified_time {SCAN_PERIOD}
+            #         AND test_id = "{test_id}"
         )
-        
+
         SELECT  *
         FROM junit_all
         # TODO: We want the records ordered by commit date. This is an imperfect approximation.
         ORDER BY modified_time ASC
     '''
 
-    df = client.query(QUERY).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
-    print(f'Found {len(df.index)} rows..')
+    client = bigquery.Client(project='openshift-gce-devel')
+    # df = client.query(QUERY).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+    df = client.query(QUERY).to_dataframe(create_bqstorage_client=True)
+    # print(f'Found {len(df.index)} rows for {test_id}..')
 
-    grouped_by_test_id = df.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'])
+    grouped_by_test_id = df.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
     for name, group in grouped_by_test_id:
-        print(f'Processing {name}')
+        # print(f'Processing {name}')
 
         linked_commits: Dict[SourceLocation, CommitSums] = dict()
         all_commits: Dict[CommitId, CommitSums] = dict()
 
         first_row = group.iloc[0]
+        test_name = first_row['test_name']
         qtest_id = f"{first_row['network']}_{first_row['upgrade']}_{first_row['arch']}_{first_row['platform']}_{first_row['test_id']}"
 
-        # First, establish the commit order for each source repo (approximate until TODO of querying github)
+        # GroupBy does not change the order of the records, so they should still be ordered by modified_time.
+        # It is assumed that if a commit A is tested before a commit B (i.e. we see a junit test targeting A first),
+        # then A precedes B in the commit history.
+        # Use this assumption to establish the commit order for each source repo (approximate until TODO of querying github)
         for t in group.itertuples():
             source_locations = t.source_locations
             commits = t.commits
@@ -247,11 +261,14 @@ if __name__ == '__main__':
                     all_commits[new_commit.commit_id] = new_commit
                 else:
                     if commit_id not in all_commits:
-                        new_commit = CommitSums(source_location, commit_id, parent_commit_sums=linked_commits[source_location])
+                        new_commit = CommitSums(source_location, commit_id,
+                                                parent_commit_sums=linked_commits[source_location])
                         linked_commits[source_location].child = new_commit
                         linked_commits[source_location] = new_commit
                         all_commits[new_commit.commit_id] = new_commit
 
+        # Iterate through again to cuckoo the test outcomes back and forth
+        # through the commit graph for each repo.
         for t in group.itertuples():
             source_locations = t.source_locations
             commits = t.commits
@@ -271,7 +288,8 @@ if __name__ == '__main__':
             'fe10',
             'fe20',
             'fe30',
-            'test_id'
+            'test_id',
+            'test_name',
         ])
         gf_idx = 0
 
@@ -290,14 +308,53 @@ if __name__ == '__main__':
                         target_commit.fe10(),
                         target_commit.fe20(),
                         target_commit.fe30(),
-                        qtest_id
+                        qtest_id,
+                        test_name
                     ]
                     gf_idx += 1
                     del all_commits[commit_id]  # Don't add this commit to table again
 
-        if len(group_frame.loc[(group_frame['fe10'] > 0.95) | (group_frame['fe20'] > 0.95) | (group_frame['fe30'] > 0.95)].index) > 10:
+        if len(group_frame.loc[(group_frame['fe10'] > 0.95) | (group_frame['fe20'] > 0.95) | (
+                group_frame['fe30'] > 0.95)].index) > 10:
             group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 3)
             group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 2)
             pathlib.Path('tests').mkdir(parents=True, exist_ok=True)
             group_frame.to_csv(f'tests/{qtest_id}.csv')
-            print(group_frame.to_string())
+
+
+if __name__ == '__main__':
+
+    repos = pathlib.Path('payload-repos.txt').read_text().strip().splitlines()
+    repos_csv = ','.join([f'"{repo}"' for repo in repos])  # "openshift/repo","openshift/repo2"
+
+    if not LIMIT_TEST_ID:
+        main_client = bigquery.Client(project='openshift-gce-devel')
+
+        ALL_TEST_IDS = f'''
+            WITH all_junit AS (
+                # SELECT DISTINCT test_id
+                # FROM `openshift-gce-devel.ci_analysis_us.junit_pr` as junit JOIN `openshift-gce-devel.ci_analysis_us.job_releases` as releases ON junit.prowjob_build_id = releases.prowjob_build_id
+                # WHERE   arch LIKE "{LIMIT_ARCH}"
+                #         AND network LIKE "{LIMIT_NETWORK}"
+                #        AND modified_time {SCAN_PERIOD}
+                #         AND release_name LIKE "4.14.0-0.nightly%"  # TODO: Expand in order to include CI / PRs instead of just nightly
+                # UNION ALL
+                SELECT DISTINCT test_id
+                FROM `openshift-gce-devel.ci_analysis_us.junit` as junit JOIN `openshift-gce-devel.ci_analysis_us.job_releases` as releases ON junit.prowjob_build_id = releases.prowjob_build_id
+                WHERE   arch LIKE "{LIMIT_ARCH}"
+                        AND network LIKE "{LIMIT_NETWORK}"
+                        AND modified_time {SCAN_PERIOD}
+                        AND release_name LIKE "4.14.0-0.nightly%"  # TODO: Expand in order to include CI / PRs instead of just nightly
+            )
+            SELECT DISTINCT test_id FROM all_junit
+    '''
+        all_test_ids = main_client.query(ALL_TEST_IDS).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')['test_id'].tolist()
+    else:
+        all_test_ids = LIMIT_TEST_ID
+    print(f'There are {len(all_test_ids)} tests to process')
+    pool = multiprocessing.Pool(processes=16)
+    for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, all_test_ids), total=len(all_test_ids)):
+        pass
+    pool.close()
+    time.sleep(10)
+

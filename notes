@@ -1,0 +1,4 @@
+sdn-no-upgrade-amd64-metal-ipi-openshift-tests:cb921b4a3fa31e83daa90cc418bb1cbc regressed on PR:
+https://github.com/openshift/cluster-storage-operator/pull/381  (972c4d885c17f60d155b86e6a02f31b4c95fd155)
+and theoretically recovered on
+https://github.com/openshift/cluster-storage-operator/pull/384 (1611e65e5ee3be3249a622727ff4b5a7b1692b59)
