@@ -5,7 +5,7 @@ import webbrowser
 
 get_labels_last_release_date = ''
 
-for csv_path in pathlib.Path('tests').glob('**/*.csv'):
+for csv_path in pathlib.Path('tests').glob('**/*bfe0d*.csv'):
     print(f'Loading {csv_path}')
     df = pandas.read_csv(str(csv_path))
     filename_base = str(csv_path)[0:-4]
@@ -20,6 +20,11 @@ for csv_path in pathlib.Path('tests').glob('**/*.csv'):
             'fe30': 'mean',
         }
     )
+
+    test_name = by_mod.iloc[0]['test_name']
+    if 'disruption' in test_name:
+        print(f'Skipping disruption test: {test_name}')
+        continue
 
     print(by_mod.to_string())
 
@@ -43,7 +48,7 @@ for csv_path in pathlib.Path('tests').glob('**/*.csv'):
 
     plt.tight_layout()
     plt.grid(visible=True, axis='x')
-    plt.title(by_mod.iloc[0]['test_name'] + ' | ' + by_mod.iloc[0]['test_id'])
+    plt.title(test_name + ' | ' + by_mod.iloc[0]['test_id'])
     plt.savefig(f'{filename_base}.png')
     print(f'wrote {filename_base}.png')
 
