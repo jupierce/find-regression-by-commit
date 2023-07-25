@@ -173,7 +173,6 @@ class CommitSums:
 SourceLocation = str
 CommitId = str
 
-SCAN_PERIOD = 'BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 2 WEEK) AND CURRENT_DATETIME()'
 # SCAN_PERIOD = 'BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 1 MONTH) AND CURRENT_DATETIME()'
 LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = 'ovn'
@@ -242,94 +241,119 @@ def analyze_test_id(name_group_commits):
                     target_commit.add_failure()
                 target_commit.add_failure(-1 * t.flake_count)
 
-        group_frame = pandas.DataFrame(columns=[
-            'release_name',
-            'modified_time',
-            'tag_commit_id',
-            'link',
-            'fe10',
-            'fe20',
-            'fe30',
-            'test_id',
-            'test_name',
-        ])
-        gf_idx = 0
+        for suffix in ('.nightly', '.ci'):
+            commits_copy = dict(all_commits)
+            group_frame = pandas.DataFrame(columns=[
+                'release_name',
+                'modified_time',
+                'tag_commit_id',
+                'link',
+                'fe10',
+                'fe20',
+                'fe30',
+                'test_id',
+                'test_name',
+            ])
+            gf_idx = 0
 
-        for t in nurp_group[nurp_group['release_name'].str.contains('nightly')].itertuples():
-            source_locations = t.source_locations
-            commits = t.commits
-            for idx in range(len(commits)):
-                commit_id = commits[idx]
-                if commit_id in all_commits:
-                    source_location = source_locations[idx]
-                    target_commit = all_commits[commit_id]
-                    group_frame.loc[gf_idx] = [
-                        t.release_name,
-                        t.modified_time,
-                        commit_id,
-                        f'{source_location}/commit/{commit_id}',
-                        target_commit.fe10(),
-                        target_commit.fe20(),
-                        target_commit.fe30(),
-                        qtest_id,
-                        test_name
-                    ]
-                    gf_idx += 1
-                    del all_commits[commit_id]  # Don't add this commit to table again
+            # There are tests which ran with a CI or PR payload in this junit data. It is
+            # hard to visualize CI / Nightlies on the same graph as they can incorporate
+            # different commits sets at different times.
+            # To have a single, linear X axes, we render only nightly release payloads in this graph.
+            for t in nurp_group[nurp_group['release_name'].str.contains(suffix + '-', regex=False)].itertuples():
+                source_locations = t.source_locations
+                commits = t.commits
+                for idx in range(len(commits)):
+                    commit_id = commits[idx]
+                    if commit_id in commits_copy:
+                        source_location = source_locations[idx]
+                        target_commit = all_commits[commit_id]
+                        group_frame.loc[gf_idx] = [
+                            t.release_name,
+                            t.modified_time,
+                            commit_id,
+                            f'{source_location}/commit/{commit_id}',
+                            target_commit.fe10(),
+                            target_commit.fe20(),
+                            target_commit.fe30(),
+                            qtest_id,
+                            test_name
+                        ]
+                        gf_idx += 1
+                        del commits_copy[commit_id]  # Don't add this commit to table again
 
-        by_mod = group_frame.groupby('release_name').aggregate(
-            {
-                'release_name': 'min',
-                'test_name': 'min',
-                'test_id': 'min',
-                'fe10': 'mean',
-                'fe20': 'mean',
-                'fe30': 'mean',
-            }
-        )
-        if len(by_mod.loc[(by_mod['fe10'] > 0.95) | (by_mod['fe20'] > 0.95) | (
-                by_mod['fe30'] > 0.95)].index) > 1:
-            group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 3)
-            group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 2)
-            pathlib.Path('tests').mkdir(parents=True, exist_ok=True)
-            group_frame.to_csv(f'tests/{qtest_id}.csv')
+            # To reduce noise, we only want to output the graph data
+            # if we find that a particular test has a high fe for more
+            # than one release_name. Group by release name and then
+            # filter out anything without that lasting signal.
+            by_mod = group_frame.groupby('release_name').aggregate(
+                {
+                    'release_name': 'min',
+                    'test_name': 'min',
+                    'test_id': 'min',
+                    'fe10': 'mean',
+                    'fe20': 'mean',
+                    'fe30': 'mean',
+                }
+            )
+            if len(by_mod.loc[(by_mod['fe10'] > 0.95) | (by_mod['fe20'] > 0.95) | (
+                    by_mod['fe30'] > 0.95)].index) > 1:
+                group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 3)
+                group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 2)
+                testdir = pathlib.Path(f'tests')
+                testdir.mkdir(parents=True, exist_ok=True)
+                group_frame.to_csv(testdir.joinpath(f'{qtest_id}{suffix}.csv'))
 
 
 if __name__ == '__main__':
     scan_period_days = 14  # days
-    before_datetime = datetime.datetime.utcnow() - datetime.timedelta(days=0.5)  # TODO: github archive does not immediately have day when UTC changes over to new day; find better commit history method.
+    before_datetime = datetime.datetime.utcnow()
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
-    before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S") + '+00'
-    after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S") + '+00'
+    before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    scan_period = f'BETWEEN DATETIME "{after_str}" AND DATETIME "{before_str}"'
 
     main_client = bigquery.Client(project='openshift-gce-devel')
 
     find_commits = ''
     date_stepper = before_datetime
-    for i in range(scan_period_days+1):
 
-        if find_commits:
-            find_commits += '\nUNION ALL\n'
+    for datestep in (1, 2):
+        try:
+            for i in range(scan_period_days+1):
 
-        find_commits += f'''
-        SELECT created_at, CONCAT("github.com/", repo.name) as repo, JSON_VALUE(payload,'$.head' ) as head, JSON_VALUE(payload,'$.before' ) as before
-        FROM `githubarchive.day.{date_stepper.strftime("%Y%m%d")}`
-        WHERE
-            type = "PushEvent"
-            AND (repo.name LIKE "operator-framework/%" OR repo.name LIKE "openshift/%") 
-        '''
-        date_stepper = date_stepper - datetime.timedelta(days=1)
+                if find_commits:
+                    find_commits += '\nUNION ALL\n'
 
-    find_commits = f'''
-        WITH commits AS (
-            {find_commits}
-        )   SELECT MIN(created_at) as created_at, head, ANY_VALUE(before) as before
-            FROM commits
-            GROUP BY head 
-            ORDER BY created_at ASC
-    '''
+                find_commits += f'''
+                SELECT created_at, CONCAT("github.com/", repo.name) as repo, JSON_VALUE(payload,'$.head' ) as head, JSON_VALUE(payload,'$.before' ) as before
+                FROM `githubarchive.day.{date_stepper.strftime("%Y%m%d")}` 
+                WHERE
+                    type = "PushEvent"
+                    AND (repo.name LIKE "operator-framework/%" OR repo.name LIKE "openshift/%") 
+                '''
+                date_stepper = date_stepper - datetime.timedelta(days=1)
 
-    commits_info = main_client.query(find_commits).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+            find_commits = f'''
+                WITH commits AS (
+                    {find_commits}
+                )   SELECT MIN(created_at) as created_at, head, ANY_VALUE(before) as before
+                    FROM commits
+                    GROUP BY head 
+                    ORDER BY created_at ASC
+            '''
+
+            commits_info = main_client.query(find_commits).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+            # Success!
+            break
+        except:
+            # Current day may not be in archive, yet, back up a single day.
+            find_commits = ''
+            date_stepper = before_datetime - datetime.timedelta(days=1)
+            if datestep == 2:
+                # Missing multiple days in github archive?
+                raise
+
     commits_ordinals: Dict[str, int] = dict()
     # Create a dict mapping each commit to an increasing integer. This will allow more
     # efficient lookup later when we need to know whether one commit came after another.
@@ -353,10 +377,8 @@ if __name__ == '__main__':
                             ANY_VALUE(release_name) as release_name, 
                             ANY_VALUE(release_created) as release_created 
                     FROM openshift-gce-devel.ci_analysis_us.job_releases jr
-                    WHERE   release_created {SCAN_PERIOD}
-                            # TODO: THIS ONLY INCLUDES NIGHTLIES AT PRESENT. INCLUDE CI PAYLOADS LATER
+                    WHERE   release_created {scan_period}
                             AND (release_name LIKE "4.14.0-0.nightly%" OR release_name LIKE "4.14.0-0.ci%")   
-                            # AND release_name LIKE "4.14.0-0.nightly%"
                     GROUP BY prowjob_build_id
                 )
     
@@ -365,7 +387,7 @@ if __name__ == '__main__':
                 FROM `openshift-gce-devel.ci_analysis_us.junit` junit INNER JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
                 WHERE   arch LIKE "{LIMIT_ARCH}"
                         AND network LIKE "{LIMIT_NETWORK}"
-                        AND junit.modified_time {SCAN_PERIOD}
+                        AND junit.modified_time {scan_period}
                         AND ENDS_WITH(test_id, "{test_id_suffix}")
                         AND test_name NOT LIKE "%disruption%"
                         AND platform LIKE "{LIMIT_PLATFORM}" 
@@ -377,7 +399,7 @@ if __name__ == '__main__':
                 # FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr INNER JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi 
                 # WHERE   arch LIKE "{LIMIT_ARCH}"
                 #         AND network LIKE "{LIMIT_NETWORK}"
-                #         AND junit_pr.modified_time {SCAN_PERIOD}
+                #         AND junit_pr.modified_time {scan_period}
                 #         AND ENDS_WITH(test_id, "{test_id_suffix}") 
                 #         AND test_name NOT LIKE "%disruption%" 
                 #         AND platform LIKE "{LIMIT_PLATFORM}" 

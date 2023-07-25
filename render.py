@@ -28,7 +28,9 @@ for csv_path in pathlib.Path('tests').glob('**/*.csv'):  #'**/*bfe0d*.csv'):
 
     print(by_mod.to_string())
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(num=csv_path.name)
+    fig.suptitle('nightly' if 'nightly' in csv_path.name else 'ci')
+
     tolerance = 5  # points
 
     def get_labels():
@@ -49,6 +51,7 @@ for csv_path in pathlib.Path('tests').glob('**/*.csv'):  #'**/*bfe0d*.csv'):
     plt.tight_layout()
     plt.grid(visible=True, axis='x')
     plt.title(test_name + ' | ' + by_mod.iloc[0]['test_id'])
+    plt.gcf().number = 't'
     plt.savefig(f'{filename_base}.png')
     print(f'wrote {filename_base}.png')
 
