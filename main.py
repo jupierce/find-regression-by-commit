@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import multiprocessing
 import datetime
-from typing import NamedTuple, List, Dict
+from typing import NamedTuple, List, Dict, Set
 import time
 import tqdm
 
@@ -94,6 +94,16 @@ class CommitSums:
         self.behind_20: ResultSum = ResultSum(20)
         self.behind_30: ResultSum = ResultSum(30)
         self.behind_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+
+    def get_parent_commit_id(self):
+        if self.parent:
+            return self.parent.commit_id
+        return None
+
+    def get_child_commit_id(self):
+        if self.child:
+            return self.child.commit_id
+        return None
 
     def add_success(self):
 
@@ -201,6 +211,7 @@ def analyze_test_id(name_group_commits):
     for name, nurp_group in grouped_by_nurp:
         # print(f'Processing {name}')
 
+        linked: Set[str] = set()
         linked_commits: Dict[SourceLocation, CommitSums] = dict()
         all_commits: Dict[CommitId, CommitSums] = dict()
 
@@ -212,6 +223,14 @@ def analyze_test_id(name_group_commits):
         for t in nurp_group.itertuples():
             source_locations = t.source_locations
             commits = list(t.commits)
+
+            # Associate the commit_ids and the source location for that
+            # commit.
+            for idx in range(len(commits)):
+                commit_id = commits[idx]
+                if commit_id not in all_commits:
+                    new_commit = CommitSums(source_locations[idx], commit_id)
+                    all_commits[new_commit.commit_id] = new_commit
 
             # If the exact ordering of a commit is not known, preserve
             # the ordering encountered in the incoming list.
@@ -226,19 +245,19 @@ def analyze_test_id(name_group_commits):
 
             commits.sort(key=ordinal_for_commit)
             for idx in range(len(commits)):
-                source_location = source_locations[idx]
                 commit_id = commits[idx]
+                new_commit = all_commits[commit_id]
+                source_location = new_commit.source_location
                 if source_location not in linked_commits:
-                    new_commit = CommitSums(source_location, commit_id)  # Initial commit found for repo
+                    # Initial commit found for repo
                     linked_commits[source_location] = new_commit
-                    all_commits[new_commit.commit_id] = new_commit
+                    linked.add(commit_id)
                 else:
-                    if commit_id not in all_commits:
-                        new_commit = CommitSums(source_location, commit_id,
-                                                parent_commit_sums=linked_commits[source_location])
+                    if commit_id not in linked:
+                        linked.add(commit_id)
+                        new_commit.parent = linked_commits[source_location]
                         linked_commits[source_location].child = new_commit
                         linked_commits[source_location] = new_commit
-                        all_commits[new_commit.commit_id] = new_commit
 
         # Iterate through again to cuckoo the test outcomes back and forth
         # through the commit graph for each repo.
@@ -280,22 +299,45 @@ def analyze_test_id(name_group_commits):
                 for idx in range(len(commits)):
                     commit_id = commits[idx]
                     if commit_id in commits_copy:
-                        source_location = source_locations[idx]
-                        target_commit = all_commits[commit_id]
-                        group_frame.loc[gf_idx] = [
-                            t.release_name,
-                            t.modified_time,
-                            commit_id,
-                            f'{source_location}/commit/{commit_id}',
-                            target_commit.fe10(),
-                            target_commit.fe20(),
-                            target_commit.fe30(),
-                            target_commit.fe1000(),
-                            qtest_id,
-                            test_name
-                        ]
-                        gf_idx += 1
-                        del commits_copy[commit_id]  # Don't add this commit to table again
+                        target_commit = commits_copy[commit_id]
+
+                        # Some commits included in our assessment may have been tested in CI
+                        # but not a nightly. Or a nightly and not CI. When a payload is
+                        # assessed, we want to show ALL commits that fed into the consideration
+                        # of a regression -- even if it was not tested directly by the
+                        # release payload stream we are rendering out.
+
+                        # As we account for commits, we remove them from commits_copy.
+                        # If our parent, parent's parent, etc are still in the dict, then
+                        # they have not yet been accounted for and should appear associated
+                        # with the release payload. Find the oldest ancestor that does not
+                        # still appears in the commits_copy. If there are none, the
+                        # oldest_ancestor == target_commit.
+                        oldest_ancestor: CommitSums = target_commit
+                        while oldest_ancestor.parent and oldest_ancestor.parent.commit_id in commits_copy:
+                            oldest_ancestor = oldest_ancestor.parent
+
+                        sliding_commit: CommitSums = oldest_ancestor
+                        while True:
+                            group_frame.loc[gf_idx] = [
+                                t.release_name,
+                                t.modified_time,
+                                sliding_commit.commit_id,
+                                f'{sliding_commit.source_location}/commit/{sliding_commit.commit_id}',
+                                target_commit.fe10(),
+                                target_commit.fe20(),
+                                target_commit.fe30(),
+                                target_commit.fe1000(),
+                                qtest_id,
+                                test_name
+                            ]
+                            gf_idx += 1
+                            del commits_copy[sliding_commit.commit_id]  # Don't add this commit to table again
+                            if sliding_commit.commit_id == target_commit.commit_id:
+                                # We are done.
+                                break
+                            # Continue to account until we reach the target commit.
+                            sliding_commit = sliding_commit.child
 
             # To reduce noise, we only want to output the graph data
             # if we find that a particular test has a high fe for more
@@ -306,10 +348,10 @@ def analyze_test_id(name_group_commits):
                     'release_name': 'min',
                     'test_name': 'min',
                     'test_id': 'min',
-                    'fe10': 'mean',
-                    'fe20': 'mean',
-                    'fe30': 'mean',
-                    'fe1000': 'mean',
+                    'fe10': 'max',
+                    'fe20': 'max',
+                    'fe30': 'max',
+                    'fe1000': 'max',
                 }
             )
             if len(by_mod.loc[(by_mod['fe10'] > 0.95) | (by_mod['fe20'] > 0.95) | (
