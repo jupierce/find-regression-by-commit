@@ -18,6 +18,7 @@ for csv_path in pathlib.Path('tests').glob('**/*.csv'):  #'**/*bfe0d*.csv'):
             'fe10': 'mean',
             'fe20': 'mean',
             'fe30': 'mean',
+            'fe1000': 'mean',
         }
     )
 
@@ -40,13 +41,13 @@ for csv_path in pathlib.Path('tests').glob('**/*.csv'):  #'**/*bfe0d*.csv'):
             labels.append(f'{row.release_name}')
         return labels
 
-    p = by_mod.plot(ax=ax, x='release_name', y=['fe10', 'fe20', 'fe30'], figsize=(20, 10), picker=tolerance, color=['r', 'y', 'g'])
+    p = by_mod.plot(ax=ax, x='release_name', y=['fe10', 'fe20', 'fe30', 'fe1000'], figsize=(20, 10), picker=tolerance, color=['r', 'orange', 'y', 'black'])
 
     ax.set_xticks(
         ticks=range(len(by_mod['release_name'])),
         labels=get_labels(),
         rotation='vertical')
-    ax.set_ylim([0, 3.05])
+    ax.set_ylim([0, 4.05])
 
     plt.tight_layout()
     plt.grid(visible=True, axis='x')

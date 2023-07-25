@@ -71,12 +71,12 @@ class ResultSum:
         return f'[s={self.success_count} f={self.failure_count} r={int(self.pass_rate() * 100)}%]'
 
 
-MAX_WINDOW_SIZE = 30
+MAX_WINDOW_SIZE = 1000
 
 
 class CommitSums:
 
-    def __init__(self, source_location:str, commit_id: str, parent_commit_sums=None, child_commit_sums=None):
+    def __init__(self, source_location: str, commit_id: str, parent_commit_sums=None, child_commit_sums=None):
         self.source_location = source_location
         self.commit_id = commit_id
         self.success_count = 0
@@ -87,11 +87,13 @@ class CommitSums:
 
         self.ahead_10: ResultSum = ResultSum(10)
         self.ahead_20: ResultSum = ResultSum(20)
-        self.ahead_30: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+        self.ahead_30: ResultSum = ResultSum(30)
+        self.ahead_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE)
 
         self.behind_10: ResultSum = ResultSum(10)
         self.behind_20: ResultSum = ResultSum(20)
-        self.behind_30: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+        self.behind_30: ResultSum = ResultSum(30)
+        self.behind_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE)
 
     def add_success(self):
 
@@ -102,6 +104,7 @@ class CommitSums:
             node.behind_10.add_success()
             node.behind_20.add_success()
             node.behind_30.add_success()
+            node.behind_1000.add_success()
             node = node.child
             count += 1
 
@@ -112,6 +115,7 @@ class CommitSums:
             node.ahead_10.add_success()
             node.ahead_20.add_success()
             node.ahead_30.add_success()
+            node.ahead_1000.add_success()
             node = node.parent
             count += 1
 
@@ -126,6 +130,7 @@ class CommitSums:
             node.behind_10.add_failure(amount)
             node.behind_20.add_failure(amount)
             node.behind_30.add_failure(amount)
+            node.behind_1000.add_failure(amount)
             node = node.child
             count += 1
 
@@ -136,6 +141,7 @@ class CommitSums:
             node.ahead_10.add_failure(amount)
             node.ahead_20.add_failure(amount)
             node.ahead_30.add_failure(amount)
+            node.ahead_1000.add_failure(amount)
             node = node.parent
             count += 1
 
@@ -147,6 +153,9 @@ class CommitSums:
 
     def fe30(self):
         return self.ahead_30.fishers_exact_regressed(self.behind_30)
+
+    def fe1000(self):
+        return self.ahead_1000.fishers_exact_regressed(self.behind_1000)
 
     def __str__(self):
         v = f'''Commit: {self.source_location}/commit/{self.commit_id}
@@ -162,6 +171,10 @@ class CommitSums:
   behind30: {self.behind_30}        
   ahead30: {self.ahead_30}
   fe30: {self.fe30()}
+1000:
+  behind1000: {self.behind_1000}        
+  ahead1000: {self.ahead_1000}
+  fe1000: {self.fe1000()}
 '''
         if self.parent:
             v += f'Parent: {self.parent.commit_id}\n'
@@ -251,6 +264,7 @@ def analyze_test_id(name_group_commits):
                 'fe10',
                 'fe20',
                 'fe30',
+                'fe1000',
                 'test_id',
                 'test_name',
             ])
@@ -276,6 +290,7 @@ def analyze_test_id(name_group_commits):
                             target_commit.fe10(),
                             target_commit.fe20(),
                             target_commit.fe30(),
+                            target_commit.fe1000(),
                             qtest_id,
                             test_name
                         ]
@@ -294,12 +309,14 @@ def analyze_test_id(name_group_commits):
                     'fe10': 'mean',
                     'fe20': 'mean',
                     'fe30': 'mean',
+                    'fe1000': 'mean',
                 }
             )
             if len(by_mod.loc[(by_mod['fe10'] > 0.95) | (by_mod['fe20'] > 0.95) | (
                     by_mod['fe30'] > 0.95)].index) > 1:
-                group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 3)
-                group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 2)
+                group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 4)
+                group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 3)
+                group_frame['fe30'] = group_frame['fe30'].apply(lambda x: x * 2)
                 testdir = pathlib.Path(f'tests')
                 testdir.mkdir(parents=True, exist_ok=True)
                 group_frame.to_csv(testdir.joinpath(f'{qtest_id}{suffix}.csv'))
@@ -343,6 +360,7 @@ if __name__ == '__main__':
                     ORDER BY created_at ASC
             '''
 
+            print('Gathering github commit information...')
             commits_info = main_client.query(find_commits).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
             # Success!
             break
@@ -362,7 +380,7 @@ if __name__ == '__main__':
         commits_ordinals[row.head] = count
         count += 1
 
-    for test_id_suffix in list('d'):  # TODO restore: list('abcdef0123456789'):
+    for test_id_suffix in list('d'): # list('abcdef0123456789'):
         suffixed_records = f'''
             WITH junit_all AS(
                 
@@ -409,6 +427,7 @@ if __name__ == '__main__':
             FROM junit_all
             ORDER BY modified_time ASC
     '''
+        print(f'Gathering test runs for suffix: {test_id_suffix}')
         all_records = main_client.query(suffixed_records).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
         print(f'There are {len(all_records)} records to process with suffix: {test_id_suffix}')
         grouped_by_test_id = all_records.groupby('test_id')
