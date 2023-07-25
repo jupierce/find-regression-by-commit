@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 import multiprocessing
-from collections import defaultdict
+import datetime
 from typing import NamedTuple, List, Dict
 import time
 import tqdm
 
-import matplotlib.pyplot
+import itertools
 import pandas
 from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
@@ -182,26 +182,37 @@ LIMIT_TEST_ID = None
 # LIMIT_TEST_ID = ['openshift-tests:cb921b4a3fa31e83daa90cc418bb1cbc']
 
 
-def analyze_test_id(name_group):
-    name, group = name_group
-    grouped_by_nurp = group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
-    for name, group in grouped_by_nurp:
+def analyze_test_id(name_group_commits):
+    name_group, commits_ordinals = name_group_commits
+    name, test_id_group = name_group
+    grouped_by_nurp = test_id_group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
+    for name, nurp_group in grouped_by_nurp:
         # print(f'Processing {name}')
 
         linked_commits: Dict[SourceLocation, CommitSums] = dict()
         all_commits: Dict[CommitId, CommitSums] = dict()
 
-        first_row = group.iloc[0]
+        first_row = nurp_group.iloc[0]
         test_name = first_row['test_name']
         qtest_id = f"{first_row['network']}_{first_row['upgrade']}_{first_row['arch']}_{first_row['platform']}_{first_row['test_id']}"
 
-        # GroupBy does not change the order of the records, so they should still be ordered by modified_time.
-        # It is assumed that if a commit A is tested before a commit B (i.e. we see a junit test targeting A first),
-        # then A precedes B in the commit history.
-        # Use this assumption to establish the commit order for each source repo (approximate until TODO of querying github)
-        for t in group.itertuples():
+        pos_for_missing_info = -100000000000
+        for t in nurp_group.itertuples():
             source_locations = t.source_locations
-            commits = t.commits
+            commits = list(t.commits)
+
+            # If the exact ordering of a commit is not known, preserve
+            # the ordering encountered in the incoming list.
+            def ordinal_for_commit(commit_id):
+                nonlocal pos_for_missing_info
+                ordinal = commits_ordinals.get(commit_id, pos_for_missing_info)
+                if ordinal < 0:
+                    pos_for_missing_info += 1
+                else:
+                    pass
+                return ordinal
+
+            commits.sort(key=ordinal_for_commit)
             for idx in range(len(commits)):
                 source_location = source_locations[idx]
                 commit_id = commits[idx]
@@ -219,7 +230,7 @@ def analyze_test_id(name_group):
 
         # Iterate through again to cuckoo the test outcomes back and forth
         # through the commit graph for each repo.
-        for t in group.itertuples():
+        for t in nurp_group.itertuples():
             source_locations = t.source_locations
             commits = t.commits
             for idx in range(len(commits)):
@@ -232,6 +243,7 @@ def analyze_test_id(name_group):
                 target_commit.add_failure(-1 * t.flake_count)
 
         group_frame = pandas.DataFrame(columns=[
+            'release_name',
             'modified_time',
             'tag_commit_id',
             'link',
@@ -243,7 +255,7 @@ def analyze_test_id(name_group):
         ])
         gf_idx = 0
 
-        for t in group.itertuples():
+        for t in nurp_group[nurp_group['release_name'].str.contains('nightly')].itertuples():
             source_locations = t.source_locations
             commits = t.commits
             for idx in range(len(commits)):
@@ -252,6 +264,7 @@ def analyze_test_id(name_group):
                     source_location = source_locations[idx]
                     target_commit = all_commits[commit_id]
                     group_frame.loc[gf_idx] = [
+                        t.release_name,
                         t.modified_time,
                         commit_id,
                         f'{source_location}/commit/{commit_id}',
@@ -264,8 +277,18 @@ def analyze_test_id(name_group):
                     gf_idx += 1
                     del all_commits[commit_id]  # Don't add this commit to table again
 
-        if len(group_frame.loc[(group_frame['fe10'] > 0.95) | (group_frame['fe20'] > 0.95) | (
-                group_frame['fe30'] > 0.95)].index) > 10:
+        by_mod = group_frame.groupby('release_name').aggregate(
+            {
+                'release_name': 'min',
+                'test_name': 'min',
+                'test_id': 'min',
+                'fe10': 'mean',
+                'fe20': 'mean',
+                'fe30': 'mean',
+            }
+        )
+        if len(by_mod.loc[(by_mod['fe10'] > 0.95) | (by_mod['fe20'] > 0.95) | (
+                by_mod['fe30'] > 0.95)].index) > 1:
             group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 3)
             group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 2)
             pathlib.Path('tests').mkdir(parents=True, exist_ok=True)
@@ -273,13 +296,49 @@ def analyze_test_id(name_group):
 
 
 if __name__ == '__main__':
-
-    repos = pathlib.Path('payload-repos.txt').read_text().strip().splitlines()
-    repos_csv = ','.join([f'"{repo}"' for repo in repos])  # "openshift/repo","openshift/repo2"
+    scan_period_days = 14  # days
+    before_datetime = datetime.datetime.utcnow() - datetime.timedelta(days=0.5)  # TODO: github archive does not immediately have day when UTC changes over to new day; find better commit history method.
+    after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
+    before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S") + '+00'
+    after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S") + '+00'
 
     main_client = bigquery.Client(project='openshift-gce-devel')
 
-    for test_id_suffix in list('abcdef0123456789'):
+    find_commits = ''
+    date_stepper = before_datetime
+    for i in range(scan_period_days+1):
+
+        if find_commits:
+            find_commits += '\nUNION ALL\n'
+
+        find_commits += f'''
+        SELECT created_at, CONCAT("github.com/", repo.name) as repo, JSON_VALUE(payload,'$.head' ) as head, JSON_VALUE(payload,'$.before' ) as before
+        FROM `githubarchive.day.{date_stepper.strftime("%Y%m%d")}`
+        WHERE
+            type = "PushEvent"
+            AND (repo.name LIKE "operator-framework/%" OR repo.name LIKE "openshift/%") 
+        '''
+        date_stepper = date_stepper - datetime.timedelta(days=1)
+
+    find_commits = f'''
+        WITH commits AS (
+            {find_commits}
+        )   SELECT MIN(created_at) as created_at, head, ANY_VALUE(before) as before
+            FROM commits
+            GROUP BY head 
+            ORDER BY created_at ASC
+    '''
+
+    commits_info = main_client.query(find_commits).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+    commits_ordinals: Dict[str, int] = dict()
+    # Create a dict mapping each commit to an increasing integer. This will allow more
+    # efficient lookup later when we need to know whether one commit came after another.
+    count = 0
+    for row in commits_info.itertuples():
+        commits_ordinals[row.head] = count
+        count += 1
+
+    for test_id_suffix in list('d'):  # TODO restore: list('abcdef0123456789'):
         suffixed_records = f'''
             WITH junit_all AS(
                 
@@ -296,8 +355,8 @@ if __name__ == '__main__':
                     FROM openshift-gce-devel.ci_analysis_us.job_releases jr
                     WHERE   release_created {SCAN_PERIOD}
                             # TODO: THIS ONLY INCLUDES NIGHTLIES AT PRESENT. INCLUDE CI PAYLOADS LATER
-                            # AND (release_name LIKE "4.14.0-0.nightly%" OR release_name LIKE "4.14.0-0.ci%")   
-                            AND release_name LIKE "4.14.0-0.nightly%"
+                            AND (release_name LIKE "4.14.0-0.nightly%" OR release_name LIKE "4.14.0-0.ci%")   
+                            # AND release_name LIKE "4.14.0-0.nightly%"
                     GROUP BY prowjob_build_id
                 )
     
@@ -326,14 +385,13 @@ if __name__ == '__main__':
     
             SELECT  *
             FROM junit_all
-            # TODO: We want the records ordered by commit date. This is an imperfect approximation.
             ORDER BY modified_time ASC
     '''
         all_records = main_client.query(suffixed_records).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
         print(f'There are {len(all_records)} records to process with suffix: {test_id_suffix}')
         grouped_by_test_id = all_records.groupby('test_id')
         pool = multiprocessing.Pool(processes=16)
-        for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, grouped_by_test_id), total=len(grouped_by_test_id.groups)):
+        for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, zip(grouped_by_test_id, itertools.repeat(commits_ordinals))), total=len(grouped_by_test_id.groups)):
             pass
         pool.close()
         time.sleep(10)

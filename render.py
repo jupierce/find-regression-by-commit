@@ -5,14 +5,14 @@ import webbrowser
 
 get_labels_last_release_date = ''
 
-for csv_path in pathlib.Path('tests').glob('**/*bfe0d*.csv'):
+for csv_path in pathlib.Path('tests').glob('**/*.csv'):  #'**/*bfe0d*.csv'):
     print(f'Loading {csv_path}')
     df = pandas.read_csv(str(csv_path))
     filename_base = str(csv_path)[0:-4]
 
-    by_mod = df.groupby('modified_time').aggregate(
+    by_mod = df.groupby('release_name').aggregate(
         {
-            'modified_time': 'min',
+            'release_name': 'min',
             'test_name': 'min',
             'test_id': 'min',
             'fe10': 'mean',
@@ -35,13 +35,13 @@ for csv_path in pathlib.Path('tests').glob('**/*bfe0d*.csv'):
         global get_labels_last_release_date
         labels = []
         for row in by_mod.itertuples():
-            labels.append(f'{row.modified_time}')
+            labels.append(f'{row.release_name}')
         return labels
 
-    p = by_mod.plot(ax=ax, x='modified_time', y=['fe10', 'fe20', 'fe30'], figsize=(20, 10), picker=tolerance, color=['r', 'y', 'g'])
+    p = by_mod.plot(ax=ax, x='release_name', y=['fe10', 'fe20', 'fe30'], figsize=(20, 10), picker=tolerance, color=['r', 'y', 'g'])
 
     ax.set_xticks(
-        ticks=range(len(by_mod['modified_time'])),
+        ticks=range(len(by_mod['release_name'])),
         labels=get_labels(),
         rotation='vertical')
     ax.set_ylim([0, 3.05])
@@ -57,9 +57,9 @@ for csv_path in pathlib.Path('tests').glob('**/*bfe0d*.csv'):
         x, y = artist.get_xdata(), artist.get_ydata()
         ind = event.ind
         print(f'Clicked ind {ind[0]}')
-        mod_time = by_mod.iloc[ind[0]].modified_time
+        mod_time = by_mod.iloc[ind[0]].release_name
         print(f'Selected modified time: {mod_time}')
-        for row in df.loc[df['modified_time'] == mod_time].itertuples():
+        for row in df.loc[df['release_name'] == mod_time].itertuples():
             webbrowser.open(url=row.link, autoraise=True)
 
     fig.canvas.callbacks.connect('pick_event', on_pick)
