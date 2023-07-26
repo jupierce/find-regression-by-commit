@@ -105,8 +105,7 @@ class CommitSums:
             return self.child.commit_id
         return None
 
-    def add_success(self):
-
+    def add_success(self, link=None):
         # Inform children of a success behind them
         node = self.child
         count = 0
@@ -129,7 +128,7 @@ class CommitSums:
             node = node.parent
             count += 1
 
-    def add_failure(self, amount=1):
+    def add_failure(self, amount=1, link=None):
         if amount == 0:  # possible when decrementing flake_count and flake_count=0
             return
 
@@ -217,7 +216,12 @@ def analyze_test_id(name_group_commits):
 
         first_row = nurp_group.iloc[0]
         test_name = first_row['test_name']
-        qtest_id = f"{first_row['network']}_{first_row['upgrade']}_{first_row['arch']}_{first_row['platform']}_{first_row['test_id']}"
+        network = first_row['network']
+        upgrade = first_row['upgrade']
+        arch = first_row['arch']
+        platform = first_row['platform']
+        test_id = first_row['test_id']
+        qtest_id = f"{network}_{upgrade}_{arch}_{platform}_{test_id}"
 
         pos_for_missing_info = -100000000000
         for t in nurp_group.itertuples():
@@ -262,15 +266,22 @@ def analyze_test_id(name_group_commits):
         # Iterate through again to cuckoo the test outcomes back and forth
         # through the commit graph for each repo.
         for t in nurp_group.itertuples():
-            source_locations = t.source_locations
-            commits = t.commits
-            for idx in range(len(commits)):
-                commit_id = commits[idx]
+            prowjob_name = t.prowjob_name
+            prowjob_build_id = t.prowjob_build_id
+            job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
+
+            # Within a release payload, a commit may be encountered multiple times: one
+            # for each component it is associated with (e.g. openshift/oc is associated with
+            # cli, cli-artifacts, deployer, and tools). We don't want each these components
+            # count an individual success/failure against the oc commit, or we will
+            # 4x count it. Convert the commits into a set to dedupe.
+            commits = set(list(t.commits))
+            for commit_id in commits:
                 target_commit = all_commits[commit_id]
                 if t.success_val == 1:
-                    target_commit.add_success()
+                    target_commit.add_success(link=job_link)
                 else:
-                    target_commit.add_failure()
+                    target_commit.add_failure(link=job_link)
                 target_commit.add_failure(-1 * t.flake_count)
 
         for suffix in ('.nightly', '.ci'):
@@ -281,9 +292,25 @@ def analyze_test_id(name_group_commits):
                 'tag_commit_id',
                 'link',
                 'fe10',
+                'a_s10',
+                'a_f10',
+                'b_s10',
+                'b_f10',
                 'fe20',
+                'a_s20',
+                'a_f20',
+                'b_s20',
+                'b_f20',
                 'fe30',
+                'a_s30',
+                'a_f30',
+                'b_s30',
+                'b_f30',
                 'fe1000',
+                'a_s1000',
+                'a_f1000',
+                'b_s1000',
+                'b_f1000',
                 'test_id',
                 'test_name',
             ])
@@ -324,10 +351,30 @@ def analyze_test_id(name_group_commits):
                                 t.modified_time,
                                 sliding_commit.commit_id,
                                 f'{sliding_commit.source_location}/commit/{sliding_commit.commit_id}',
+
                                 target_commit.fe10(),
+                                target_commit.ahead_10.success_count,
+                                target_commit.ahead_10.failure_count,
+                                target_commit.behind_10.success_count,
+                                target_commit.behind_10.failure_count,
+
                                 target_commit.fe20(),
+                                target_commit.ahead_20.success_count,
+                                target_commit.ahead_20.failure_count,
+                                target_commit.behind_20.success_count,
+                                target_commit.behind_20.failure_count,
+
                                 target_commit.fe30(),
+                                target_commit.ahead_30.success_count,
+                                target_commit.ahead_30.failure_count,
+                                target_commit.behind_30.success_count,
+                                target_commit.behind_30.failure_count,
+
                                 target_commit.fe1000(),
+                                target_commit.ahead_1000.success_count,
+                                target_commit.ahead_1000.failure_count,
+                                target_commit.behind_1000.success_count,
+                                target_commit.behind_1000.failure_count,
                                 qtest_id,
                                 test_name
                             ]

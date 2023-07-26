@@ -93,25 +93,64 @@ def main():
                     <h2>{csv_path.name}</h2>
                     <h2>{release_name}</h2>
                     <br>
-                    <table>
-                        <tr>
+                    <table border="1">
+                        <tr> 
+                            <th>before (s/f=ratio)</th>
+                            <th>after</th>
                             <th>fe10</th>
+
+                            <th>before (s/f=ratio)</th>
+                            <th>after</th>
                             <th>fe20</th>
+
+                            <th>before (s/f=ratio)</th>
+                            <th>after</th>
                             <th>fe30</th>
+
+                            <th>before (s/f=ratio)</th>
+                            <th>after</th>
                             <th>fe1000</th>
+
                             <th>commit</th>
                         </tr>
 ''')
 
                 carried_commits = df.loc[df['release_name'] == release_name]
-                for row in carried_commits.sort_values(['fe10', 'fe20', 'fe30', 'fe1000'], ascending=False).itertuples():
+                for row in carried_commits.sort_values([
+                    'fe10',
+                    'fe20',
+                    'fe30',
+                    'fe1000'
+                ], ascending=False).itertuples():
+
+                    def entry(success: int, failure: int) -> str:
+                        pass_rate = 1.0
+                        if failure + success != 0:
+                            pass_rate = success / (success + failure)
+                        pass_rate *= 100.0
+                        return f'{success}/{failure} => {pass_rate:.1f}%'
+
+                    org, repo, _, commit = row.link.split('/')[3:]
                     f.write(f'''
                         <tr>
-                            <td>{row.fe10}</td>
-                            <td>{row.fe20}</td>
-                            <td>{row.fe30}</td>
-                            <td>{row.fe1000}</td>
-                            <td><a href="{row.link}">{row.link}</a></td>
+                            <td>{entry(row.b_s10, row.b_f10)}</td>
+                            <td>{entry(row.a_s10, row.a_f10)}</td>
+                            <td>{row.fe10/4:.3f}</td>
+
+                            <td>{entry(row.b_s20, row.b_f20)}</td>
+                            <td>{entry(row.a_s20, row.a_f20)}</td>
+                            <td>{row.fe20/3:.3f}</td>
+
+                            <td>{entry(row.b_s30, row.b_f30)}</td>
+                            <td>{entry(row.a_s30, row.a_f30)}</td>
+                            <td>{row.fe30/2:.3f}</td>
+
+                            <td>{entry(row.b_s1000, row.b_f1000)}</td>
+                            <td>{entry(row.a_s1000, row.a_f1000)}</td>
+                            <td>{row.fe1000:.3f}</td>
+
+                            
+                            <td>{org}/{repo} <a href="{row.link}">{commit}</a></td>
                         </tr>
 ''')
                 f.write(f'''
