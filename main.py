@@ -197,10 +197,11 @@ CommitId = str
 
 # SCAN_PERIOD = 'BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 1 MONTH) AND CURRENT_DATETIME()'
 LIMIT_ARCH = 'amd64'
-LIMIT_NETWORK = 'ovn'
-LIMIT_PLATFORM = 'gcp'
-LIMIT_TEST_ID = None
-# LIMIT_TEST_ID = ['openshift-tests:cb921b4a3fa31e83daa90cc418bb1cbc']
+LIMIT_NETWORK = '%'
+LIMIT_PLATFORM = '%'
+LIMIT_UPGRADE = '%'
+LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
+# LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 
 
 def analyze_test_id(name_group_commits):
@@ -248,6 +249,7 @@ def analyze_test_id(name_group_commits):
                 return ordinal
 
             commits.sort(key=ordinal_for_commit)
+
             for idx in range(len(commits)):
                 commit_id = commits[idx]
                 new_commit = all_commits[commit_id]
@@ -262,6 +264,12 @@ def analyze_test_id(name_group_commits):
                         new_commit.parent = linked_commits[source_location]
                         linked_commits[source_location].child = new_commit
                         linked_commits[source_location] = new_commit
+
+            # with pathlib.Path(f'{qtest_id}-commits.txt').open(mode='w+') as f:
+            #     for commit_sum in all_commits.values():
+            #         f.write(f'Commit {commit_sum.commit_id} in {commit_sum.source_location} has parent commit: {commit_sum.get_parent_commit_id()}\n')
+            #
+            # nurp_group.to_csv(f'{qtest_id}-nurp-tests.csv')
 
         # Iterate through again to cuckoo the test outcomes back and forth
         # through the commit graph for each repo.
@@ -469,7 +477,7 @@ if __name__ == '__main__':
         commits_ordinals[row.head] = count
         count += 1
 
-    for test_id_suffix in list('d'): # list('abcdef0123456789'):
+    for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
         suffixed_records = f'''
             WITH junit_all AS(
                 
@@ -498,6 +506,7 @@ if __name__ == '__main__':
                         AND ENDS_WITH(test_id, "{test_id_suffix}")
                         AND test_name NOT LIKE "%disruption%"
                         AND platform LIKE "{LIMIT_PLATFORM}" 
+                        AND upgrade LIKE "{LIMIT_UPGRADE}" 
                 # IGNORE TESTING FROM PRs for the time being.
                 # UNION ALL    
     
@@ -510,6 +519,7 @@ if __name__ == '__main__':
                 #         AND ENDS_WITH(test_id, "{test_id_suffix}") 
                 #         AND test_name NOT LIKE "%disruption%" 
                 #         AND platform LIKE "{LIMIT_PLATFORM}" 
+                #         AND upgrade LIKE "{LIMIT_UPGRADE}" 
             )
     
             SELECT  *

@@ -9,10 +9,14 @@ import time
 def main():
     get_labels_last_release_date = ''
 
-    for csv_path in pathlib.Path('tests').glob('**/*.csv'):  #'**/*bfe0d*.csv'):
+    for csv_path in pathlib.Path('tests').glob('**/*.csv'):
         print(f'Loading {csv_path}')
         df = pandas.read_csv(str(csv_path))
         filename_base = str(csv_path)[0:-4]
+        png_path = pathlib.Path(f'{filename_base}.png')
+        # if png_path.exists():
+        #     print(f'Already rendered: {str(png_path)} - skipping')
+        #     continue
 
         tmpdir = pathlib.Path('tmp')
         tmpdir.mkdir(parents=True, exist_ok=True)
@@ -60,8 +64,8 @@ def main():
         plt.grid(visible=True, axis='x')
         plt.title(test_name + ' | ' + by_mod.iloc[0]['test_id'])
         plt.gcf().number = 't'
-        plt.savefig(f'{filename_base}.png')
-        print(f'wrote {filename_base}.png')
+        plt.savefig(f'{str(png_path)}')
+        print(f'wrote {str(png_path)}')
 
         last_click_x = -1
         last_click_y = -1
@@ -130,7 +134,12 @@ def main():
                         pass_rate *= 100.0
                         return f'{success}/{failure} => {pass_rate:.1f}%'
 
-                    org, repo, _, commit = row.link.split('/')[3:]
+                    if row.link.startswith('https://github.com/'):
+                        org, repo, _, commit = row.link.split('/')[3:]
+                    else:
+                        org = row.link
+                        repo = ''
+                        commit = row.tag_commit_id
                     f.write(f'''
                         <tr>
                             <td>{entry(row.b_s10, row.b_f10)}</td>
