@@ -36,10 +36,11 @@ class WrappedInteger:
 
 class ResultSum:
 
-    def __init__(self, max_records: int, success_count=0, failure_count=0):
+    def __init__(self, max_records: int, commit_id):
         self.max_records = max_records
-        self.success_count = success_count
-        self.failure_count = failure_count
+        self.success_count = 0
+        self.failure_count = 0
+        self.commit_id = commit_id
 
     def add_success(self):
         if self.success_count + self.failure_count < self.max_records:
@@ -85,15 +86,23 @@ class CommitSums:
         self.parent = parent_commit_sums
         self.child = child_commit_sums
 
-        self.ahead_10: ResultSum = ResultSum(10)
-        self.ahead_20: ResultSum = ResultSum(20)
-        self.ahead_30: ResultSum = ResultSum(30)
-        self.ahead_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+        self.ahead_10: ResultSum = ResultSum(10, commit_id)
+        self.ahead_20: ResultSum = ResultSum(20, commit_id)
+        self.ahead_30: ResultSum = ResultSum(30, commit_id)
+        self.ahead_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE, commit_id)
 
-        self.behind_10: ResultSum = ResultSum(10)
-        self.behind_20: ResultSum = ResultSum(20)
-        self.behind_30: ResultSum = ResultSum(30)
-        self.behind_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE)
+        self.behind_10: ResultSum = ResultSum(10, commit_id)
+        self.behind_20: ResultSum = ResultSum(20, commit_id)
+        self.behind_30: ResultSum = ResultSum(30, commit_id)
+        self.behind_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE, commit_id)
+
+    def get_ancestor_ids(self) -> List[str]:
+        ancestors_commit_ids = []
+        node = self.parent
+        while node:
+            ancestors_commit_ids.append(node.commit_id)
+            node = node.parent
+        return ancestors_commit_ids
 
     def get_parent_commit_id(self):
         if self.parent:
@@ -200,8 +209,8 @@ LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = '%'
 LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'
-LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
-# LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
+# LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
+LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 
 
 def analyze_test_id(name_group_commits):
@@ -297,8 +306,9 @@ def analyze_test_id(name_group_commits):
             group_frame = pandas.DataFrame(columns=[
                 'release_name',
                 'modified_time',
+                'source_location',
                 'tag_commit_id',
-                'link',
+                'ancestor_commit_ids',
                 'fe10',
                 'a_s10',
                 'a_f10',
@@ -357,27 +367,24 @@ def analyze_test_id(name_group_commits):
                             group_frame.loc[gf_idx] = [
                                 t.release_name,
                                 t.modified_time,
+                                sliding_commit.source_location,
                                 sliding_commit.commit_id,
-                                f'{sliding_commit.source_location}/commit/{sliding_commit.commit_id}',
-
+                                sliding_commit.get_ancestor_ids(),
                                 target_commit.fe10(),
                                 target_commit.ahead_10.success_count,
                                 target_commit.ahead_10.failure_count,
                                 target_commit.behind_10.success_count,
                                 target_commit.behind_10.failure_count,
-
                                 target_commit.fe20(),
                                 target_commit.ahead_20.success_count,
                                 target_commit.ahead_20.failure_count,
                                 target_commit.behind_20.success_count,
                                 target_commit.behind_20.failure_count,
-
                                 target_commit.fe30(),
                                 target_commit.ahead_30.success_count,
                                 target_commit.ahead_30.failure_count,
                                 target_commit.behind_30.success_count,
                                 target_commit.behind_30.failure_count,
-
                                 target_commit.fe1000(),
                                 target_commit.ahead_1000.success_count,
                                 target_commit.ahead_1000.failure_count,
@@ -529,7 +536,7 @@ if __name__ == '__main__':
         print(f'Gathering test runs for suffix: {test_id_suffix}')
         all_records = main_client.query(suffixed_records).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
         print(f'There are {len(all_records)} records to process with suffix: {test_id_suffix}')
-        grouped_by_test_id = all_records.groupby('test_id')
+        grouped_by_test_id = all_records.groupby('test_id', sort=False)
         pool = multiprocessing.Pool(processes=16)
         for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, zip(grouped_by_test_id, itertools.repeat(commits_ordinals))), total=len(grouped_by_test_id.groups)):
             pass

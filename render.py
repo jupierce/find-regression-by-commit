@@ -87,35 +87,63 @@ def main():
 
             html_path = tmpdir.joinpath(f'{release_name}.html')
             with html_path.open(mode='w+') as f:
+
+                commit_detail_tables: list[str] = list()
+
                 f.write(f'''
                 <html>
                 <head>
                     <title>{release_name}</title>
+                    <style>
+                        .styled-table {{
+                            margin: 25px 0;
+                            font-size: 0.9em;
+                            font-family: sans-serif;
+                            min-width: 400px;
+                            box-shadow: 0 0 20px rgba(0, 0, 0, 0.15);
+                        }}      
+                        .styled-table thead tr {{
+                            background-color: #009879;
+                            color: #ffffff;
+                            text-align: left;
+                        }}          
+                        .styled-table th,
+                        .styled-table td {{
+                            padding: 12px 15px;
+                        }}   
+                        .styled-table tbody tr {{
+                            border-bottom: 1px solid #dddddd;
+                        }}
+                        .styled-table tbody tr:nth-of-type(even) {{
+                            background-color: #f3f3f3;
+                        }}
+                        .styled-table tbody tr:last-of-type {{
+                            border-bottom: 2px solid #009879;
+                        }}
+                        .styled-table tbody tr.active-row {{
+                            font-weight: bold;
+                            color: #009879;
+                        }}                                                                                                 
+                    </style>
                 </head>
                 <body>
                     <h2>{test_name}</h2>
                     <h2>{csv_path.name}</h2>
                     <h2>{release_name}</h2>
                     <br>
-                    <table border="1">
+                    <table class="styled-table">
                         <tr> 
-                            <th>before (s/f=ratio)</th>
-                            <th>after</th>
                             <th>fe10</th>
 
-                            <th>before (s/f=ratio)</th>
-                            <th>after</th>
                             <th>fe20</th>
 
-                            <th>before (s/f=ratio)</th>
-                            <th>after</th>
                             <th>fe30</th>
 
-                            <th>before (s/f=ratio)</th>
-                            <th>after</th>
                             <th>fe1000</th>
 
                             <th>commit</th>
+                            
+                            <th>source location</th>
                         </tr>
 ''')
 
@@ -127,44 +155,105 @@ def main():
                     'fe1000'
                 ], ascending=False).itertuples():
 
-                    def entry(success: int, failure: int) -> str:
-                        pass_rate = 1.0
-                        if failure + success != 0:
-                            pass_rate = success / (success + failure)
-                        pass_rate *= 100.0
-                        return f'{success}/{failure} => {pass_rate:.1f}%'
-
-                    if row.link.startswith('https://github.com/'):
-                        org, repo, _, commit = row.link.split('/')[3:]
+                    link = row.source_location + '/commit/' + row.tag_commit_id
+                    if link.startswith('https://github.com/'):
+                        org, repo, _, commit = link.split('/')[3:]
                     else:
-                        org = row.link
+                        org = link
                         repo = ''
                         commit = row.tag_commit_id
                     f.write(f'''
                         <tr>
-                            <td>{entry(row.b_s10, row.b_f10)}</td>
-                            <td>{entry(row.a_s10, row.a_f10)}</td>
                             <td>{row.fe10/4:.3f}</td>
 
-                            <td>{entry(row.b_s20, row.b_f20)}</td>
-                            <td>{entry(row.a_s20, row.a_f20)}</td>
                             <td>{row.fe20/3:.3f}</td>
 
-                            <td>{entry(row.b_s30, row.b_f30)}</td>
-                            <td>{entry(row.a_s30, row.a_f30)}</td>
                             <td>{row.fe30/2:.3f}</td>
 
-                            <td>{entry(row.b_s1000, row.b_f1000)}</td>
-                            <td>{entry(row.a_s1000, row.a_f1000)}</td>
                             <td>{row.fe1000:.3f}</td>
-
                             
-                            <td>{org}/{repo} <a href="{row.link}">{commit}</a></td>
+                            <td><a href="#{commit}">{commit}</a></td>
+                            
+                            <td>{org}/{repo}</td> 
                         </tr>
 ''')
+                    def success_rate(success: int, failure: int) -> str:
+                        pass_rate = 1.0
+                        if failure + success != 0:
+                            pass_rate = success / (success + failure)
+                        pass_rate *= 100.0
+                        return f'{pass_rate:.1f}%'
+
+                    commit_detail = f'''
+                        <br>
+                        <a id="{commit}"/>
+                        <b>Source:</b> <a href="{link}">{link}</a>
+                        <table class="styled-table">
+                            <tr> 
+                                <th>type</th>
+                                <th colspan="3">fe10</th>
+                                <th colspan="3">fe20</th>
+                                <th colspan="3">fe30</th>
+                                <th colspan="3">fe1000</th>
+                            </tr>
+                            <tr>
+                                <th>Before Commit</th>
+                                <td style='color:green;'>{row.b_s10}</td>
+                                <td style='color:red;'>{row.b_f10}</td>
+                                <td>{success_rate(row.b_s10, row.b_f10)}</td>
+                                
+                                <td style='color:green;'>{row.b_s20}</td>
+                                <td style='color:red;'>{row.b_f20}</td>
+                                <td>{success_rate(row.b_s20, row.b_f20)}</td>
+
+                                <td style='color:green;'>{row.b_s30}</td>
+                                <td style='color:red;'>{row.b_f30}</td>
+                                <td>{success_rate(row.b_s30, row.b_f30)}</td>
+                                
+                                <td style='color:green;'>{row.b_s1000}</td>
+                                <td style='color:red;'>{row.b_f1000}</td>
+                                <td>{success_rate(row.b_s1000, row.b_f1000)}</td>
+                            <tr>
+                            <tr>
+                                <th>After Commit</th>
+                                <td style='color:green;'>{row.a_s10}</td>
+                                <td style='color:red;'>{row.a_f10}</td>
+                                <td>{success_rate(row.a_s10, row.a_f10)}</td>
+
+                                <td style='color:green;'>{row.a_s20}</td>
+                                <td style='color:red;'>{row.a_f20}</td>
+                                <td>{success_rate(row.a_s20, row.a_f20)}</td>
+
+                                <td style='color:green;'>{row.a_s30}</td>
+                                <td style='color:red;'>{row.a_f30}</td>
+                                <td>{success_rate(row.a_s30, row.a_f30)}</td>
+
+                                <td style='color:green;'>{row.a_s1000}</td>
+                                <td style='color:red;'>{row.a_f1000}</td>
+                                <td>{success_rate(row.a_s1000, row.a_f1000)}</td>
+                            <tr>
+                            <tr>
+                                <th>Regression Probability</th>
+                                <td colspan="3" style="text-align: center;">{row.fe10/4*100:.2f}%</td>
+                                <td colspan="3" style="text-align: center;">{row.fe20/3*100:.2f}%</td>
+                                <td colspan="3" style="text-align: center;">{row.fe30/2*100:.2f}%</td>
+                                <td colspan="3" style="text-align: center;">{row.fe1000*100:.2f}%</td>
+                            </th>
+                        </table>
+'''
+                    commit_detail_tables.append(commit_detail)
+
                 f.write(f'''
                     </table>
                     <br>
+''')
+
+                for commit_detail in commit_detail_tables:
+                    f.write('<br>\n')
+                    f.write(commit_detail)
+                    f.write('<br>\n')
+
+                f.write(f'''
                 </body>
                 </html>
 ''')
