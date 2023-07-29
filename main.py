@@ -114,7 +114,7 @@ class CommitSums:
             return self.child.commit_id
         return None
 
-    def add_success(self, link=None):
+    def add_behind_success(self, link=None):
         # Inform children of a success behind them
         node = self.child
         count = 0
@@ -126,6 +126,7 @@ class CommitSums:
             node = node.child
             count += 1
 
+    def add_ahead_success(self, link=None):
         # Inform parents and self of a success ahead of them
         node = self
         count = 0
@@ -137,7 +138,7 @@ class CommitSums:
             node = node.parent
             count += 1
 
-    def add_failure(self, amount=1, link=None):
+    def add_behind_failure(self, amount=1, link=None):
         if amount == 0:  # possible when decrementing flake_count and flake_count=0
             return
 
@@ -152,6 +153,7 @@ class CommitSums:
             node = node.child
             count += 1
 
+    def add_ahead_failure(self, amount=1, link=None):
         # Inform parents and self of a failure ahead of them
         node = self
         count = 0
@@ -296,10 +298,33 @@ def analyze_test_id(name_group_commits):
             for commit_id in commits:
                 target_commit = all_commits[commit_id]
                 if t.success_val == 1:
-                    target_commit.add_success(link=job_link)
+                    target_commit.add_ahead_success(link=job_link)
                 else:
-                    target_commit.add_failure(link=job_link)
-                target_commit.add_failure(-1 * t.flake_count)
+                    target_commit.add_ahead_failure(link=job_link)
+                target_commit.add_ahead_failure(-1 * t.flake_count)
+
+        # For the "behind" aggregators, we want to prioritize successes/failures
+        # as close to the introduction of the commit as possible. Reversing the
+        # nurp puts modified_time in DESC order (backwards in time).
+        nurp_group_reversed = nurp_group.iloc[::-1]
+        for t in nurp_group_reversed.itertuples():
+            prowjob_name = t.prowjob_name
+            prowjob_build_id = t.prowjob_build_id
+            job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
+
+            # Within a release payload, a commit may be encountered multiple times: one
+            # for each component it is associated with (e.g. openshift/oc is associated with
+            # cli, cli-artifacts, deployer, and tools). We don't want each these components
+            # count an individual success/failure against the oc commit, or we will
+            # 4x count it. Convert the commits into a set to dedupe.
+            commits = set(list(t.commits))
+            for commit_id in commits:
+                target_commit = all_commits[commit_id]
+                if t.success_val == 1:
+                    target_commit.add_behind_success(link=job_link)
+                else:
+                    target_commit.add_behind_failure(link=job_link)
+                target_commit.add_behind_failure(-1 * t.flake_count)
 
         for suffix in ('.nightly', '.ci'):
             commits_copy = dict(all_commits)

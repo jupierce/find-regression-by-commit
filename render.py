@@ -234,10 +234,10 @@ def main():
                             <tr>
                             <tr>
                                 <th>Regression Probability</th>
-                                <td colspan="3" style="text-align: center;">{row.fe10/4*100:.2f}%</td>
-                                <td colspan="3" style="text-align: center;">{row.fe20/3*100:.2f}%</td>
-                                <td colspan="3" style="text-align: center;">{row.fe30/2*100:.2f}%</td>
-                                <td colspan="3" style="text-align: center;">{row.fe1000*100:.2f}%</td>
+                                <td title="{row.fe10}" colspan="3" style="text-align: center;">{row.fe10/4*100:.2f}%</td>
+                                <td title="{row.fe20}" colspan="3" style="text-align: center;">{row.fe20/3*100:.2f}%</td>
+                                <td title="{row.fe30}" colspan="3" style="text-align: center;">{row.fe30/2*100:.2f}%</td>
+                                <td title="{row.fe1000}" colspan="3" style="text-align: center;">{row.fe1000*100:.2f}%</td>
                             </th>
                         </table>
 '''
