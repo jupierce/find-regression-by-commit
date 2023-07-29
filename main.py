@@ -206,7 +206,7 @@ class CommitSums:
 SourceLocation = str
 CommitId = str
 
-# SCAN_PERIOD = 'BETWEEN DATETIME_SUB(CURRENT_DATETIME(), INTERVAL 1 MONTH) AND CURRENT_DATETIME()'
+INCLUDE_PR_TESTS = False
 LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = '%'
 LIMIT_PLATFORM = '%'
@@ -472,7 +472,11 @@ if __name__ == '__main__':
                     find_commits += '\nUNION ALL\n'
 
                 find_commits += f'''
-                SELECT created_at, CONCAT("github.com/", repo.name) as repo, JSON_VALUE(payload,'$.head' ) as head, JSON_VALUE(payload,'$.before' ) as before
+                SELECT created_at, CONCAT("github.com/", repo.name) as repo, 
+                    ARRAY(
+                        SELECT JSON_EXTRACT_SCALAR(x, '$.sha')
+                        FROM UNNEST(JSON_EXTRACT_ARRAY(payload,'$.commits' )) x
+                    ) as commits
                 FROM `githubarchive.day.{date_stepper.strftime("%Y%m%d")}` 
                 WHERE
                     type = "PushEvent"
@@ -483,14 +487,38 @@ if __name__ == '__main__':
             find_commits = f'''
                 WITH commits AS (
                     {find_commits}
-                )   SELECT MIN(created_at) as created_at, head, ANY_VALUE(before) as before
+                )   SELECT *
                     FROM commits
-                    GROUP BY head 
                     ORDER BY created_at ASC
             '''
 
             print('Gathering github commit information...')
-            commits_info = main_client.query(find_commits).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+
+            # Each row includes an array of commit shas.
+            commits_bulk = main_client.query(find_commits).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+
+            commits_info = pandas.DataFrame(
+                columns=[
+                    'created_at',
+                    'repo',
+                    'commit',
+                ]
+            )
+
+            commits_info_idx = 0
+            for row in commits_bulk.itertuples():
+                for commit in row.commits:
+                    commits_info.loc[commits_info_idx] = [
+                        row.created_at,
+                        row.repo,
+                        commit,
+                    ]
+                    commits_info_idx += 1
+
+            # Commits info should now contain all commits merged into the openshift repos.
+            # This will include merge commits as well as (up to 20 -- due to PushEvent payload
+            # limitations) commits they carried into the repo.
+            commits_info.drop_duplicates()
             # Success!
             break
         except:
@@ -506,7 +534,7 @@ if __name__ == '__main__':
     # efficient lookup later when we need to know whether one commit came after another.
     count = 0
     for row in commits_info.itertuples():
-        commits_ordinals[row.head] = count
+        commits_ordinals[row.commit] = count
         count += 1
 
     for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
@@ -530,8 +558,25 @@ if __name__ == '__main__':
                 )
     
                 # Find all junit tests run in non-PR triggered tests which ran as part of those prowjobs over the last two months
-                SELECT  *
-                FROM `openshift-gce-devel.ci_analysis_us.junit` junit INNER JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
+                SELECT  modified_time,
+                        test_id,
+                        prowjob_name,
+                        junit.prowjob_build_id AS prowjob_build_id,
+                        network,
+                        upgrade,
+                        arch,
+                        platform,
+                        success_val,
+                        flake_count,
+                        test_name,
+                        commits,
+                        source_locations,
+                        release_name,
+                        release_created,
+                        0 AS is_pr, 
+                        "N/A" as pr_sha
+                FROM    `openshift-gce-devel.ci_analysis_us.junit` junit 
+                        INNER JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
                 WHERE   arch LIKE "{LIMIT_ARCH}"
                         AND network LIKE "{LIMIT_NETWORK}"
                         AND junit.modified_time {scan_period}
@@ -540,28 +585,76 @@ if __name__ == '__main__':
                         AND platform LIKE "{LIMIT_PLATFORM}" 
                         AND upgrade LIKE "{LIMIT_UPGRADE}" 
                 # IGNORE TESTING FROM PRs for the time being.
-                # UNION ALL    
+                UNION ALL    
     
-                # # Find all junit tests run in PR triggered tests which ran as part of those prowjobs over the last two months
-                # SELECT  *
-                # FROM `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr INNER JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi 
-                # WHERE   arch LIKE "{LIMIT_ARCH}"
-                #         AND network LIKE "{LIMIT_NETWORK}"
-                #         AND junit_pr.modified_time {scan_period}
-                #         AND ENDS_WITH(test_id, "{test_id_suffix}") 
-                #         AND test_name NOT LIKE "%disruption%" 
-                #         AND platform LIKE "{LIMIT_PLATFORM}" 
-                #         AND upgrade LIKE "{LIMIT_UPGRADE}" 
+                # Find all junit tests run in PR triggered tests which ran as part of those prowjobs over the last two months
+                SELECT  modified_time,
+                        test_id,
+                        prowjob_name,
+                        junit_pr.prowjob_build_id AS prowjob_build_id,
+                        network,
+                        upgrade,
+                        arch,
+                        platform,
+                        success_val,
+                        flake_count,
+                        test_name,
+                        commits,
+                        source_locations,
+                        release_name,
+                        release_created,
+                        1 AS is_pr,
+                        jobs.pr_sha AS pr_sha
+                FROM    `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr 
+                        INNER JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi
+                        INNER JOIN `openshift-gce-devel.ci_analysis_us.jobs` jobs ON junit_pr.prowjob_build_id = jobs.prowjob_build_id 
+                WHERE   arch LIKE "{LIMIT_ARCH}"
+                        AND network LIKE "{LIMIT_NETWORK}"
+                        AND junit_pr.modified_time {scan_period}
+                        AND ENDS_WITH(test_id, "{test_id_suffix}") 
+                        AND test_name NOT LIKE "%disruption%" 
+                        AND platform LIKE "{LIMIT_PLATFORM}" 
+                        AND upgrade LIKE "{LIMIT_UPGRADE}" 
             )
     
             SELECT  *
             FROM junit_all
             ORDER BY modified_time ASC
     '''
+
+        # Construct a definitive set including all commits that ultimately merged during
+        # our observation period.
+        merged_commits = set(commits_info['commit'].tolist())
+
         print(f'Gathering test runs for suffix: {test_id_suffix}')
         all_records = main_client.query(suffixed_records).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
-        print(f'There are {len(all_records)} records to process with suffix: {test_id_suffix}')
-        grouped_by_test_id = all_records.groupby('test_id', sort=False)
+
+        for row in all_records[all_records['is_pr'] == 0].itertuples():
+            # if a test ran outside of pre-merge testing, we can assume that
+            # any commits in the payload have previously merged (before our
+            # observation period. Add any such commits to the merged_commits
+            # set.
+            merged_commits.update(row.commits)
+
+        all_record_count = len(all_records.index)
+        pr_record_count = len(all_records[all_records['is_pr'] == 1])
+        print(f'Non-PR Records {all_record_count-pr_record_count}')
+        print(f'    PR Records {pr_record_count}')
+
+        if INCLUDE_PR_TESTS:
+            # If a pr triggered test tests commits that are now a subset of all trusted / merged
+            # commits, then promote the pr test to a non-pr test.
+            for i, row in all_records.iterrows():
+                if row.is_pr == 1 and row.pr_sha in merged_commits:
+                    all_records.at[i, 'is_pr'] = 0
+
+        # Drop all records that were pre-merge tests containing untrusted commits.
+        trusted_records = all_records[all_records['is_pr'] == 0]
+        trusted_record_count = len(trusted_records.index)
+        print(f'Dropped {all_record_count-trusted_record_count} untrusted records')
+
+        print(f'There are {len(trusted_records)} records to process with suffix: {test_id_suffix}')
+        grouped_by_test_id = trusted_records.groupby('test_id', sort=False)
         pool = multiprocessing.Pool(processes=16)
         for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, zip(grouped_by_test_id, itertools.repeat(commits_ordinals))), total=len(grouped_by_test_id.groups)):
             pass
