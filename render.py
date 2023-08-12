@@ -11,7 +11,7 @@ def main():
 
     for csv_path in pathlib.Path('tests').glob('**/*.csv'):
         print(f'Loading {csv_path}')
-        df = pandas.read_csv(str(csv_path))
+        df = pandas.read_csv(str(csv_path), float_precision='round_trip')  # round_trip prevents loss of accuracy in floats https://stackoverflow.com/a/47368368
         filename_base = str(csv_path)[0:-4]
         png_path = pathlib.Path(f'{filename_base}.png')
         # if png_path.exists():

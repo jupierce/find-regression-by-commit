@@ -104,6 +104,14 @@ class CommitSums:
             node = node.parent
         return ancestors_commit_ids
 
+    def get_descendant_ids(self) -> List[str]:
+        descendant_ids = []
+        node = self.child
+        while node:
+            descendant_ids.append(node.commit_id)
+            node = node.child
+        return descendant_ids
+
     def get_parent_commit_id(self):
         if self.parent:
             return self.parent.commit_id
@@ -208,10 +216,11 @@ CommitId = str
 
 INCLUDE_PR_TESTS = False
 LIMIT_ARCH = 'amd64'
-LIMIT_NETWORK = '%'
-LIMIT_PLATFORM = '%'
-LIMIT_UPGRADE = '%'
+LIMIT_NETWORK = 'ovn'
+LIMIT_PLATFORM = 'gcp'
+LIMIT_UPGRADE = 'upgrade-micro'
 # LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
+# LIMIT_TEST_ID_SUFFIXES = list('56789')  # ids end with a hex digit, so cover everything.
 LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 
 
@@ -225,6 +234,10 @@ def analyze_test_id(name_group_commits):
         linked: Set[str] = set()
         linked_commits: Dict[SourceLocation, CommitSums] = dict()
         all_commits: Dict[CommitId, CommitSums] = dict()
+
+        # Contains a list of all commits. Within a given repo, the commits in this list should
+        # be in chronological order. Between different repos, there is no guarantee.
+        ordered_commits = list()
 
         first_row = nurp_group.iloc[0]
         test_name = first_row['test_name']
@@ -260,6 +273,7 @@ def analyze_test_id(name_group_commits):
                 return ordinal
 
             commits.sort(key=ordinal_for_commit)
+            ordered_commits.extend(commits)
 
             for idx in range(len(commits)):
                 commit_id = commits[idx]
@@ -282,49 +296,57 @@ def analyze_test_id(name_group_commits):
             #
             # nurp_group.to_csv(f'{qtest_id}-nurp-tests.csv')
 
+        # Make a row for each test result against each commit.
+        flattened_nurp_group = nurp_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
+        ordered_commits = list(dict.fromkeys(ordered_commits))  # fast way to remove dupes while preserving order: https://stackoverflow.com/a/17016257
+        flattened_nurp_group['commits'] = pandas.Categorical(flattened_nurp_group['commits'], ordered_commits)  # When subsequently sorted, this will sort the entries by their location in the ordered_commits
+        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], inplace=True)
+
+        # Within a release payload, a commit may be encountered multiple times: one
+        # for each component it is associated with (e.g. openshift/oc is associated with
+        # cli, cli-artifacts, deployer, and tools). We don't want each these components
+        # count an individual success/failure against the oc commit, or we will
+        # 4x count it. Convert the commits into a set to dedupe.
+        flattened_nurp_group.drop_duplicates(inplace=True)
+
+        target_commit = linked_commits['https://github.com/openshift/cloud-credential-operator']
+        interesting_commits = target_commit.get_ancestor_ids() + target_commit.get_descendant_ids() + [target_commit.commit_id]
+        hits = flattened_nurp_group.loc[flattened_nurp_group['commits'].isin(interesting_commits)]
+        hits.to_csv('hits.csv')
+
         # Iterate through again to cuckoo the test outcomes back and forth
         # through the commit graph for each repo.
-        for t in nurp_group.itertuples():
+        for t in flattened_nurp_group.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
             job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
 
-            # Within a release payload, a commit may be encountered multiple times: one
-            # for each component it is associated with (e.g. openshift/oc is associated with
-            # cli, cli-artifacts, deployer, and tools). We don't want each these components
-            # count an individual success/failure against the oc commit, or we will
-            # 4x count it. Convert the commits into a set to dedupe.
-            commits = set(list(t.commits))
-            for commit_id in commits:
-                target_commit = all_commits[commit_id]
-                if t.success_val == 1:
-                    target_commit.add_ahead_success(link=job_link)
-                else:
-                    target_commit.add_ahead_failure(link=job_link)
-                target_commit.add_ahead_failure(-1 * t.flake_count)
+            target_commit = all_commits[t.commits]
+            if t.success_val == 1:
+                target_commit.add_ahead_success(link=job_link)
+            else:
+                target_commit.add_ahead_failure(link=job_link)
+            target_commit.add_ahead_failure(-1 * t.flake_count)
+
 
         # For the "behind" aggregators, we want to prioritize successes/failures
         # as close to the introduction of the commit as possible. Reversing the
         # nurp puts modified_time in DESC order (backwards in time).
-        nurp_group_reversed = nurp_group.iloc[::-1]
-        for t in nurp_group_reversed.itertuples():
+        # Without this reversal, old ancestors will fill up a commit's
+        # max aggregation value before newer/closer ancestor results.
+        flattened_nurp_group_reversed = flattened_nurp_group.iloc[::-1]
+        # flattened_nurp_group_reversed = flattened_nurp_group   # TODO: THIS IS NOT REVERSED FOR DEBUG PURPOSES!
+        for t in flattened_nurp_group_reversed.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
             job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
 
-            # Within a release payload, a commit may be encountered multiple times: one
-            # for each component it is associated with (e.g. openshift/oc is associated with
-            # cli, cli-artifacts, deployer, and tools). We don't want each these components
-            # count an individual success/failure against the oc commit, or we will
-            # 4x count it. Convert the commits into a set to dedupe.
-            commits = set(list(t.commits))
-            for commit_id in commits:
-                target_commit = all_commits[commit_id]
-                if t.success_val == 1:
-                    target_commit.add_behind_success(link=job_link)
-                else:
-                    target_commit.add_behind_failure(link=job_link)
-                target_commit.add_behind_failure(-1 * t.flake_count)
+            target_commit = all_commits[t.commits]
+            if t.success_val == 1:
+                target_commit.add_behind_success(link=job_link)
+            else:
+                target_commit.add_behind_failure(link=job_link)
+            target_commit.add_behind_failure(-1 * t.flake_count)
 
         for suffix in ('.nightly', '.ci'):
             commits_copy = dict(all_commits)
@@ -362,7 +384,7 @@ def analyze_test_id(name_group_commits):
             # There are tests which ran with a CI or PR payload in this junit data. It is
             # hard to visualize CI / Nightlies on the same graph as they can incorporate
             # different commits sets at different times.
-            # To have a single, linear X axes, we render only nightly release payloads in this graph.
+            # To have a single, linear X axis, we render only nightly release payloads in this graph.
             for t in nurp_group[nurp_group['release_name'].str.contains(suffix + '-', regex=False)].itertuples():
                 source_locations = t.source_locations
                 commits = t.commits
@@ -381,7 +403,7 @@ def analyze_test_id(name_group_commits):
                         # If our parent, parent's parent, etc are still in the dict, then
                         # they have not yet been accounted for and should appear associated
                         # with the release payload. Find the oldest ancestor that does not
-                        # still appears in the commits_copy. If there are none, the
+                        # still appear in the commits_copy. If there are none, then
                         # oldest_ancestor == target_commit.
                         oldest_ancestor: CommitSums = target_commit
                         while oldest_ancestor.parent and oldest_ancestor.parent.commit_id in commits_copy:
@@ -395,26 +417,26 @@ def analyze_test_id(name_group_commits):
                                 sliding_commit.source_location,
                                 sliding_commit.commit_id,
                                 sliding_commit.get_ancestor_ids(),
-                                target_commit.fe10(),
-                                target_commit.ahead_10.success_count,
-                                target_commit.ahead_10.failure_count,
-                                target_commit.behind_10.success_count,
-                                target_commit.behind_10.failure_count,
-                                target_commit.fe20(),
-                                target_commit.ahead_20.success_count,
-                                target_commit.ahead_20.failure_count,
-                                target_commit.behind_20.success_count,
-                                target_commit.behind_20.failure_count,
-                                target_commit.fe30(),
-                                target_commit.ahead_30.success_count,
-                                target_commit.ahead_30.failure_count,
-                                target_commit.behind_30.success_count,
-                                target_commit.behind_30.failure_count,
-                                target_commit.fe1000(),
-                                target_commit.ahead_1000.success_count,
-                                target_commit.ahead_1000.failure_count,
-                                target_commit.behind_1000.success_count,
-                                target_commit.behind_1000.failure_count,
+                                sliding_commit.fe10(),
+                                sliding_commit.ahead_10.success_count,
+                                sliding_commit.ahead_10.failure_count,
+                                sliding_commit.behind_10.success_count,
+                                sliding_commit.behind_10.failure_count,
+                                sliding_commit.fe20(),
+                                sliding_commit.ahead_20.success_count,
+                                sliding_commit.ahead_20.failure_count,
+                                sliding_commit.behind_20.success_count,
+                                sliding_commit.behind_20.failure_count,
+                                sliding_commit.fe30(),
+                                sliding_commit.ahead_30.success_count,
+                                sliding_commit.ahead_30.failure_count,
+                                sliding_commit.behind_30.success_count,
+                                sliding_commit.behind_30.failure_count,
+                                sliding_commit.fe1000(),
+                                sliding_commit.ahead_1000.success_count,
+                                sliding_commit.ahead_1000.failure_count,
+                                sliding_commit.behind_1000.success_count,
+                                sliding_commit.behind_1000.failure_count,
                                 qtest_id,
                                 test_name
                             ]
@@ -453,7 +475,9 @@ def analyze_test_id(name_group_commits):
 
 if __name__ == '__main__':
     scan_period_days = 14  # days
-    before_datetime = datetime.datetime.utcnow()
+    # before_datetime = datetime.datetime.utcnow()
+    # TODO: REMOVE subtraction in before_datetime to prevent searching in the past
+    before_datetime = datetime.datetime.utcnow() - datetime.timedelta(days=scan_period_days)
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
     before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S")
     after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S")
