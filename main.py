@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 import multiprocessing
 import datetime
-from typing import NamedTuple, List, Dict, Set
+from typing import NamedTuple, List, Dict, Set, Tuple
 import time
 import tqdm
+from collections import OrderedDict
 
 import itertools
 import pandas
 from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
-import matplotlib.pyplot as plt
-import pathlib
-
+from functools import cached_property
 
 class WrappedInteger:
     def __init__(self, value=0):
@@ -34,67 +33,75 @@ class WrappedInteger:
         return self._value
 
 
-class ResultSum:
+class OutcomePair:
 
     def __init__(self, max_records: int, commit_id):
         self.max_records = max_records
         self.success_count = 0
         self.failure_count = 0
         self.commit_id = commit_id
+        self.prowjob_urls: OrderedDict = OrderedDict()
 
-    def add_success(self):
-        if self.success_count + self.failure_count < self.max_records:
-            self.success_count += 1
+    def add_success(self, amount=1, prowjob_url: str = None):
+        if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
+            self.success_count += amount
+            if prowjob_url:
+                self.prowjob_urls[prowjob_url] = 'S'
 
-    def add_failure(self, amount=1):
-        if self.success_count + self.failure_count < self.max_records:
+    def add_failure(self, amount=1, prowjob_url: str = None):
+        if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
             self.failure_count += amount
             if self.failure_count < 0:
                 # This can happen if we hit a flake_count > row, but datetime aligns us after the rows of the failures they account for.
                 self.failure_count = 0
+                if prowjob_url:
+                    self.prowjob_urls[prowjob_url] = 'F'
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
             return self.success_count / (self.success_count + self.failure_count)
         return 0.0
 
-    def fishers_exact_regressed(self, result_sum2) -> float:
-        # If at least ten tests have run including this commit and
+    def fishers_exact(self, result_sum2) -> float:
         # if we have regressed at least 10% relative to the result we are comparing to.
-        if result_sum2.pass_rate() - self.pass_rate() > 0.10:
-            return 1 - fast_fisher_cython.fisher_exact(
+        if result_sum2.pass_rate() > self.pass_rate():
+            return -1 + fast_fisher_cython.fisher_exact(
                 self.failure_count, self.success_count,
                 result_sum2.failure_count, result_sum2.success_count,
                 alternative='greater')
+        elif self.pass_rate() > result_sum2.pass_rate():
+            # If there has been improvement
+            return 1 - fast_fisher_cython.fisher_exact(
+                self.failure_count, self.success_count,
+                result_sum2.failure_count, result_sum2.success_count,
+                alternative='less')
+
         return 0.0
 
     def __str__(self):
         return f'[s={self.success_count} f={self.failure_count} r={int(self.pass_rate() * 100)}%]'
 
 
-MAX_WINDOW_SIZE = 1000
+MAX_WINDOW_SIZE = 30
 
 
-class CommitSums:
+class CommitOutcomes:
 
     def __init__(self, source_location: str, commit_id: str, parent_commit_sums=None, child_commit_sums=None):
         self.source_location = source_location
         self.commit_id = commit_id
-        self.success_count = 0
-        self.failure_count = 0
-        self.flake_count = 0
         self.parent = parent_commit_sums
         self.child = child_commit_sums
 
-        self.ahead_10: ResultSum = ResultSum(10, commit_id)
-        self.ahead_20: ResultSum = ResultSum(20, commit_id)
-        self.ahead_30: ResultSum = ResultSum(30, commit_id)
-        self.ahead_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE, commit_id)
+        self.discrete_outcomes = OutcomePair(-1, commit_id)  # Tests run against exactly this commit.
 
-        self.behind_10: ResultSum = ResultSum(10, commit_id)
-        self.behind_20: ResultSum = ResultSum(20, commit_id)
-        self.behind_30: ResultSum = ResultSum(30, commit_id)
-        self.behind_1000: ResultSum = ResultSum(MAX_WINDOW_SIZE, commit_id)
+        self.ahead_10: OutcomePair = OutcomePair(10, commit_id)
+        self.ahead_20: OutcomePair = OutcomePair(20, commit_id)
+        self.ahead_30: OutcomePair = OutcomePair(30, commit_id)
+
+        self.behind_10: OutcomePair = OutcomePair(10, commit_id)
+        self.behind_20: OutcomePair = OutcomePair(20, commit_id)
+        self.behind_30: OutcomePair = OutcomePair(30, commit_id)
 
     def get_ancestor_ids(self) -> List[str]:
         ancestors_commit_ids = []
@@ -122,31 +129,30 @@ class CommitSums:
             return self.child.commit_id
         return None
 
-    def add_behind_success(self, link=None):
+    def inform_children_of_success_behind_them(self, prowjob_url: str = None):
         # Inform children of a success behind them
         node = self.child
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.behind_10.add_success()
-            node.behind_20.add_success()
-            node.behind_30.add_success()
-            node.behind_1000.add_success()
+            node.behind_10.add_success(prowjob_url=prowjob_url)
+            node.behind_20.add_success(prowjob_url=prowjob_url)
+            node.behind_30.add_success(prowjob_url=prowjob_url)
             node = node.child
             count += 1
 
-    def add_ahead_success(self, link=None):
+    def inform_ancestors_of_success_including_them(self, prowjob_url: str = None):
         # Inform parents and self of a success ahead of them
         node = self
+        self.discrete_outcomes.add_success(prowjob_url=prowjob_url)
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.ahead_10.add_success()
-            node.ahead_20.add_success()
-            node.ahead_30.add_success()
-            node.ahead_1000.add_success()
+            node.ahead_10.add_success(prowjob_url=prowjob_url)
+            node.ahead_20.add_success(prowjob_url=prowjob_url)
+            node.ahead_30.add_success(prowjob_url=prowjob_url)
             node = node.parent
             count += 1
 
-    def add_behind_failure(self, amount=1, link=None):
+    def inform_children_of_failure_behind_them(self, amount=1, prowjob_url: str = None):
         if amount == 0:  # possible when decrementing flake_count and flake_count=0
             return
 
@@ -154,55 +160,127 @@ class CommitSums:
         node = self.child
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.behind_10.add_failure(amount)
-            node.behind_20.add_failure(amount)
-            node.behind_30.add_failure(amount)
-            node.behind_1000.add_failure(amount)
+            node.behind_10.add_failure(amount, prowjob_url=prowjob_url)
+            node.behind_20.add_failure(amount, prowjob_url=prowjob_url)
+            node.behind_30.add_failure(amount, prowjob_url=prowjob_url)
             node = node.child
             count += 1
 
-    def add_ahead_failure(self, amount=1, link=None):
+    def inform_ancestors_of_failure_including_them(self, amount=1, prowjob_url: str = None):
         # Inform parents and self of a failure ahead of them
         node = self
+        self.discrete_outcomes.add_failure(amount=amount, prowjob_url=prowjob_url)
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.ahead_10.add_failure(amount)
-            node.ahead_20.add_failure(amount)
-            node.ahead_30.add_failure(amount)
-            node.ahead_1000.add_failure(amount)
+            node.ahead_10.add_failure(amount, prowjob_url=prowjob_url)
+            node.ahead_20.add_failure(amount, prowjob_url=prowjob_url)
+            node.ahead_30.add_failure(amount, prowjob_url=prowjob_url)
             node = node.parent
             count += 1
 
+    @cached_property
     def fe10(self):
-        return self.ahead_10.fishers_exact_regressed(self.behind_10)
+        return self.ahead_10.fishers_exact(self.behind_10)
 
+    @cached_property
+    def fe10_incoming_slope(self):
+        if self.parent:
+            return self.fe10 - self.parent.fe10
+        return 0.0
+
+    @cached_property
     def fe20(self):
-        return self.ahead_20.fishers_exact_regressed(self.behind_20)
+        return self.ahead_20.fishers_exact(self.behind_20)
 
+    @cached_property
     def fe30(self):
-        return self.ahead_30.fishers_exact_regressed(self.behind_30)
+        return self.ahead_30.fishers_exact(self.behind_30)
 
-    def fe1000(self):
-        return self.ahead_1000.fishers_exact_regressed(self.behind_1000)
+    @cached_property
+    def worse_than_parent(self) -> bool:
+        return self.parent and self.parent.fe10 > self.fe10
+
+    def _behind_scan(self) -> Tuple[int, int]:
+        successes, failures = self.discrete_outcomes.success_count, self.discrete_outcomes.failure_count
+        if self.worse_than_parent:
+            # If I have a parent and their fe10 is better than or
+            # equal to my own.
+            p_successes, p_failures = self.parent._behind_scan()
+            successes += p_successes
+            failures += p_failures
+        return successes, failures
+
+    @cached_property
+    def behind_dynamic(self) -> OutcomePair:
+        bs = self._behind_scan()
+        behind = OutcomePair(-1, self.commit_id)
+        # Looking behind us, we should not include our own successes/failures
+        behind.add_success(amount=bs[0] - self.discrete_outcomes.success_count)
+        behind.add_failure(amount=bs[1] - self.discrete_outcomes.failure_count)
+        return behind
+
+    @cached_property
+    def worse_than_child(self) -> bool:
+        # if a commit does not have a child, it is the last known commit
+        # for a repo. Return True for childless so that it can be considered
+        # a peak.
+        # Otherwise, return True only if the child fe is better than ours.
+        return (not self.child) or self.child.fe10 > self.fe10
+
+    def _ahead_scan(self) -> Tuple[int, int]:
+        successes, failures = self.discrete_outcomes.success_count, self.discrete_outcomes.failure_count
+
+        # If I have a child and their fe10 is better than mine, failures are tilted in
+        # this commit's direction. If child.fe10 happens to be equal
+        # to our own, we reason that the child failures are statistically
+        # worse because they include our own failures but have not
+        # begun to normalize. Thus the child is more likely to be the peak.
+        if self.worse_than_child:
+            if self.child and self.child.fe10 <= 0:
+                # If the child also has a decline in signal, their results are
+                # going to be included in our dynamically sized fe.
+                c_successes, c_failures = self.child._ahead_scan()
+                successes += c_successes
+                failures += c_failures
+        return successes, failures
+
+    @cached_property
+    def ahead_dynamic(self) -> OutcomePair:
+        successes, failures = self._ahead_scan()
+        ahead = OutcomePair(-1, commit_id=self.commit_id)
+        ahead.add_success(amount=successes)
+        ahead.add_failure(amount=failures)
+        return ahead
+
+    def is_peak(self):
+        return self.worse_than_parent and self.worse_than_child
+
+    @cached_property
+    def fe_dynamic(self):
+        behind = self.behind_dynamic
+        ahead = self.ahead_dynamic
+        return ahead.fishers_exact(behind)
 
     def __str__(self):
         v = f'''Commit: {self.source_location}/commit/{self.commit_id}
+Peak: {self.is_peak()}
+Discrete: {self.discrete_outcomes}
 10:
   behind10: {self.behind_10}        
   ahead10: {self.ahead_10}
-  fe10: {self.fe10()}
+  fe10: {self.fe10}
 20:
   behind10: {self.behind_20}        
   ahead10: {self.ahead_20}
-  fe20: {self.fe20()}
+  fe20: {self.fe20}
 30:
   behind30: {self.behind_30}        
   ahead30: {self.ahead_30}
-  fe30: {self.fe30()}
-1000:
-  behind1000: {self.behind_1000}        
-  ahead1000: {self.ahead_1000}
-  fe1000: {self.fe1000()}
+  fe30: {self.fe30}
+dynamic:
+  behind: {self.behind_dynamic}
+  ahead: {self.ahead_dynamic}
+  fe: {self.fe_dynamic}
 '''
         if self.parent:
             v += f'Parent: {self.parent.commit_id}\n'
@@ -214,7 +292,7 @@ class CommitSums:
 SourceLocation = str
 CommitId = str
 
-INCLUDE_PR_TESTS = False
+INCLUDE_PR_TESTS = True
 LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = 'ovn'
 LIMIT_PLATFORM = 'gcp'
@@ -232,8 +310,8 @@ def analyze_test_id(name_group_commits):
         # print(f'Processing {name}')
 
         linked: Set[str] = set()
-        linked_commits: Dict[SourceLocation, CommitSums] = dict()
-        all_commits: Dict[CommitId, CommitSums] = dict()
+        linked_commits: Dict[SourceLocation, CommitOutcomes] = dict()
+        all_commits: Dict[CommitId, CommitOutcomes] = dict()
 
         # Contains a list of all commits. Within a given repo, the commits in this list should
         # be in chronological order. Between different repos, there is no guarantee.
@@ -258,7 +336,7 @@ def analyze_test_id(name_group_commits):
             for idx in range(len(commits)):
                 commit_id = commits[idx]
                 if commit_id not in all_commits:
-                    new_commit = CommitSums(source_locations[idx], commit_id)
+                    new_commit = CommitOutcomes(source_locations[idx], commit_id)
                     all_commits[new_commit.commit_id] = new_commit
 
             # If the exact ordering of a commit is not known, preserve
@@ -309,11 +387,6 @@ def analyze_test_id(name_group_commits):
         # 4x count it. Convert the commits into a set to dedupe.
         flattened_nurp_group.drop_duplicates(inplace=True)
 
-        target_commit = linked_commits['https://github.com/openshift/cloud-credential-operator']
-        interesting_commits = target_commit.get_ancestor_ids() + target_commit.get_descendant_ids() + [target_commit.commit_id]
-        hits = flattened_nurp_group.loc[flattened_nurp_group['commits'].isin(interesting_commits)]
-        hits.to_csv('hits.csv')
-
         # Iterate through again to cuckoo the test outcomes back and forth
         # through the commit graph for each repo.
         for t in flattened_nurp_group.itertuples():
@@ -323,10 +396,10 @@ def analyze_test_id(name_group_commits):
 
             target_commit = all_commits[t.commits]
             if t.success_val == 1:
-                target_commit.add_ahead_success(link=job_link)
+                target_commit.inform_ancestors_of_success_including_them(prowjob_url=job_link)
             else:
-                target_commit.add_ahead_failure(link=job_link)
-            target_commit.add_ahead_failure(-1 * t.flake_count)
+                target_commit.inform_ancestors_of_failure_including_them(prowjob_url=job_link)
+            target_commit.inform_ancestors_of_failure_including_them(-1 * t.flake_count)
 
 
         # For the "behind" aggregators, we want to prioritize successes/failures
@@ -335,7 +408,6 @@ def analyze_test_id(name_group_commits):
         # Without this reversal, old ancestors will fill up a commit's
         # max aggregation value before newer/closer ancestor results.
         flattened_nurp_group_reversed = flattened_nurp_group.iloc[::-1]
-        # flattened_nurp_group_reversed = flattened_nurp_group   # TODO: THIS IS NOT REVERSED FOR DEBUG PURPOSES!
         for t in flattened_nurp_group_reversed.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
@@ -343,134 +415,36 @@ def analyze_test_id(name_group_commits):
 
             target_commit = all_commits[t.commits]
             if t.success_val == 1:
-                target_commit.add_behind_success(link=job_link)
+                target_commit.inform_children_of_success_behind_them(prowjob_url=job_link)
             else:
-                target_commit.add_behind_failure(link=job_link)
-            target_commit.add_behind_failure(-1 * t.flake_count)
+                target_commit.inform_children_of_failure_behind_them(prowjob_url=job_link)
+            target_commit.inform_children_of_failure_behind_them(-1 * t.flake_count)
 
-        for suffix in ('.nightly', '.ci'):
-            commits_copy = dict(all_commits)
-            group_frame = pandas.DataFrame(columns=[
-                'release_name',
-                'modified_time',
-                'source_location',
-                'tag_commit_id',
-                'ancestor_commit_ids',
-                'fe10',
-                'a_s10',
-                'a_f10',
-                'b_s10',
-                'b_f10',
-                'fe20',
-                'a_s20',
-                'a_f20',
-                'b_s20',
-                'b_f20',
-                'fe30',
-                'a_s30',
-                'a_f30',
-                'b_s30',
-                'b_f30',
-                'fe1000',
-                'a_s1000',
-                'a_f1000',
-                'b_s1000',
-                'b_f1000',
-                'test_id',
-                'test_name',
-            ])
-            gf_idx = 0
-
-            # There are tests which ran with a CI or PR payload in this junit data. It is
-            # hard to visualize CI / Nightlies on the same graph as they can incorporate
-            # different commits sets at different times.
-            # To have a single, linear X axis, we render only nightly release payloads in this graph.
-            for t in nurp_group[nurp_group['release_name'].str.contains(suffix + '-', regex=False)].itertuples():
-                source_locations = t.source_locations
-                commits = t.commits
-                for idx in range(len(commits)):
-                    commit_id = commits[idx]
-                    if commit_id in commits_copy:
-                        target_commit = commits_copy[commit_id]
-
-                        # Some commits included in our assessment may have been tested in CI
-                        # but not a nightly. Or a nightly and not CI. When a payload is
-                        # assessed, we want to show ALL commits that fed into the consideration
-                        # of a regression -- even if it was not tested directly by the
-                        # release payload stream we are rendering out.
-
-                        # As we account for commits, we remove them from commits_copy.
-                        # If our parent, parent's parent, etc are still in the dict, then
-                        # they have not yet been accounted for and should appear associated
-                        # with the release payload. Find the oldest ancestor that does not
-                        # still appear in the commits_copy. If there are none, then
-                        # oldest_ancestor == target_commit.
-                        oldest_ancestor: CommitSums = target_commit
-                        while oldest_ancestor.parent and oldest_ancestor.parent.commit_id in commits_copy:
-                            oldest_ancestor = oldest_ancestor.parent
-
-                        sliding_commit: CommitSums = oldest_ancestor
-                        while True:
-                            group_frame.loc[gf_idx] = [
-                                t.release_name,
-                                t.modified_time,
-                                sliding_commit.source_location,
-                                sliding_commit.commit_id,
-                                sliding_commit.get_ancestor_ids(),
-                                sliding_commit.fe10(),
-                                sliding_commit.ahead_10.success_count,
-                                sliding_commit.ahead_10.failure_count,
-                                sliding_commit.behind_10.success_count,
-                                sliding_commit.behind_10.failure_count,
-                                sliding_commit.fe20(),
-                                sliding_commit.ahead_20.success_count,
-                                sliding_commit.ahead_20.failure_count,
-                                sliding_commit.behind_20.success_count,
-                                sliding_commit.behind_20.failure_count,
-                                sliding_commit.fe30(),
-                                sliding_commit.ahead_30.success_count,
-                                sliding_commit.ahead_30.failure_count,
-                                sliding_commit.behind_30.success_count,
-                                sliding_commit.behind_30.failure_count,
-                                sliding_commit.fe1000(),
-                                sliding_commit.ahead_1000.success_count,
-                                sliding_commit.ahead_1000.failure_count,
-                                sliding_commit.behind_1000.success_count,
-                                sliding_commit.behind_1000.failure_count,
-                                qtest_id,
-                                test_name
-                            ]
-                            gf_idx += 1
-                            del commits_copy[sliding_commit.commit_id]  # Don't add this commit to table again
-                            if sliding_commit.commit_id == target_commit.commit_id:
-                                # We are done.
-                                break
-                            # Continue to account until we reach the target commit.
-                            sliding_commit = sliding_commit.child
-
-            # To reduce noise, we only want to output the graph data
-            # if we find that a particular test has a high fe for more
-            # than one release_name. Group by release name and then
-            # filter out anything without that lasting signal.
-            by_mod = group_frame.groupby('release_name').aggregate(
-                {
-                    'release_name': 'min',
-                    'test_name': 'min',
-                    'test_id': 'min',
-                    'fe10': 'max',
-                    'fe20': 'max',
-                    'fe30': 'max',
-                    'fe1000': 'max',
-                }
+        def le_grande_order(commit: CommitOutcomes):
+            # Returning a tuple means order by first attribute, then next, then..
+            return (
+                commit.fe_dynamic,
+                commit.fe10_incoming_slope,
+                commit.discrete_outcomes.pass_rate(),
+                -1 * commit.ahead_dynamic.failure_count,
+                commit.fe10,
+                commit.fe20,
+                commit.fe30,
             )
-            if len(by_mod.loc[(by_mod['fe10'] > 0.95) | (by_mod['fe20'] > 0.95) | (
-                    by_mod['fe30'] > 0.95)].index) > 1:
-                group_frame['fe10'] = group_frame['fe10'].apply(lambda x: x * 4)
-                group_frame['fe20'] = group_frame['fe20'].apply(lambda x: x * 3)
-                group_frame['fe30'] = group_frame['fe30'].apply(lambda x: x * 2)
-                testdir = pathlib.Path(f'tests')
-                testdir.mkdir(parents=True, exist_ok=True)
-                group_frame.to_csv(testdir.joinpath(f'{qtest_id}{suffix}.csv'))
+
+        relevant_count = 0
+        by_le_grande_order = sorted(list(all_commits.values()), key=le_grande_order)
+        for c in by_le_grande_order:
+            if c.fe_dynamic > -0.98:
+                break
+            if not c.is_peak():
+                continue
+            relevant_count += 1
+            print(f'{c.fe_dynamic} -> {le_grande_order(c)}')
+            print(c)
+            print()
+
+        print(f'Found {relevant_count}')
 
 
 if __name__ == '__main__':
