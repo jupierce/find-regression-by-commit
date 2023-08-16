@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import multiprocessing
 import datetime
-from typing import NamedTuple, List, Dict, Set, Tuple
+from typing import NamedTuple, List, Dict, Set, Tuple, Optional
 import time
 import tqdm
 from collections import OrderedDict
@@ -263,14 +263,14 @@ class CommitOutcomes:
 
         if self.worse_than_child:
             node = self
-            while node.child and node.worse_than_child and node.child.fe10 <= 0:  # traverse as a valley
+            while node.child and node.worse_than_child and node.child.fe10 <= 0:  # traverse as a valley. Stop if child is improving.
                 successes += node.child.discrete_outcomes.success_count
                 failures += node.child.discrete_outcomes.failure_count
                 node = node.child
 
         else:
             node = self
-            while node.child and node.better_than_child and node.child.fe10 >= 0:  # traverse as peak
+            while node.child and node.better_than_child and node.child.fe10 >= 0:  # traverse as peak. Stop if child is regressing.
                 successes += node.child.discrete_outcomes.success_count
                 failures += node.child.discrete_outcomes.failure_count
                 node = node.child
@@ -291,6 +291,32 @@ class CommitOutcomes:
     def is_peak(self):
         return self.better_than_parent and self.better_than_child
 
+    def github_link(self):
+        return f'{self.source_location}/commit/{self.commit_id}'
+
+    def regression_info(self):
+        """
+        :return: Returns True for the first element of the Tuple if this was a regression.
+                    The second element of the Tuple is a commit outcomes the system believes resolved
+                    the regression. None if the regression is still active.
+        """
+        if self.fe_dynamic < -0.98 and self.is_valley():
+            # Qualifies as regression.
+            resolving_outcome = None
+            node = self.child
+            while node:
+                if node.is_peak():
+                    resolution_fe = node.ahead_30.fishers_exact(self.behind_30)
+                    if abs(resolution_fe) < 0.1:  # The closer to 0, the less statistically significant the difference
+                        # We've found a peak in front of our valley. Ahead of it
+                        # and behind us look very similar statistically. Assume
+                        # it resolves us.
+                        return True, node.github_link()
+                node = node.child
+            return True, None
+        else:
+            return False, None
+
     @cached_property
     def fe_dynamic(self):
         behind = self.behind_dynamic
@@ -298,10 +324,11 @@ class CommitOutcomes:
         return ahead.fishers_exact(behind)
 
     def __str__(self):
-        v = f'''Commit: {self.source_location}/commit/{self.commit_id}
+        v = f'''Commit: {self.github_link()}
 Peak: {self.is_peak()}
 Valley: {self.is_valley()}
 Discrete: {self.discrete_outcomes}
+Regression Info: {self.regression_info()}
 10:
   behind10: {self.behind_10}        
   ahead10: {self.ahead_10}
@@ -332,7 +359,7 @@ CommitId = str
 INCLUDE_PR_TESTS = True
 LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = 'ovn'
-LIMIT_PLATFORM = 'gcp'
+LIMIT_PLATFORM = 'azure'
 LIMIT_UPGRADE = 'upgrade-micro'
 # LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
 # LIMIT_TEST_ID_SUFFIXES = list('56789')  # ids end with a hex digit, so cover everything.
