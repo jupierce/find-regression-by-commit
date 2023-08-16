@@ -33,6 +33,25 @@ class WrappedInteger:
         return self._value
 
 
+class ProwJobRun:
+    def __init__(self, commit_id, prowjob_name, prowjob_build_id, modified_time):
+        self.commit_id = commit_id
+        self.prowjob_name = prowjob_name
+        self.prowjob_build_id = prowjob_build_id
+        self.modified_name = modified_time
+        self.success_count = 0
+        self.failure_count = 0
+        self.flake_count = 0
+
+    def add_success(self):
+        self.success_count += 1
+
+    def add_failure(self, amount):
+        self.failure_count += amount
+        if amount < 0:
+            self.flake_count += amount
+
+
 class OutcomePair:
 
     def __init__(self, max_records: int, commit_id):
@@ -40,7 +59,8 @@ class OutcomePair:
         self.success_count = 0
         self.failure_count = 0
         self.commit_id = commit_id
-        self.prowjob_urls: OrderedDict = OrderedDict()
+
+        self.prowjob_urls: OrderedDict[str, str] = OrderedDict()
 
     def add_success(self, amount=1, prowjob_url: str = None):
         if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
@@ -54,8 +74,9 @@ class OutcomePair:
             if self.failure_count < 0:
                 # This can happen if we hit a flake_count > row, but datetime aligns us after the rows of the failures they account for.
                 self.failure_count = 0
-                if prowjob_url:
-                    self.prowjob_urls[prowjob_url] = 'F'
+            if prowjob_url not in self.prowjob_urls:
+                # TODO: Success will take precedence. We are not tracking flakes.
+                self.prowjob_urls[prowjob_url] = 'F'
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
@@ -307,7 +328,7 @@ class CommitOutcomes:
             while node:
                 if node.is_peak():
                     resolution_fe = node.ahead_30.fishers_exact(self.behind_30)
-                    if abs(resolution_fe) < 0.1:  # The closer to 0, the less statistically significant the difference
+                    if resolution_fe >= -0.5:  # If the signal has improved or is close to statistically insignificant.
                         # We've found a peak in front of our valley. Ahead of it
                         # and behind us look very similar statistically. Assume
                         # it resolves us.
@@ -373,9 +394,10 @@ def analyze_test_id(name_group_commits):
     for name, nurp_group in grouped_by_nurp:
         # print(f'Processing {name}')
 
-        linked: Set[str] = set()
-        linked_commits: Dict[SourceLocation, CommitOutcomes] = dict()
-        all_commits: Dict[CommitId, CommitOutcomes] = dict()
+        # As we visit each test, keep track of the commits we see in the payloads in the order
+        # we see them. If we don't have definitive ordering information from github, we will
+        # use the order in which commits are observed as a heuristic for parent/child links.
+        all_commits: OrderedDict[CommitId, CommitOutcomes] = OrderedDict()
 
         # Contains a list of all commits. Within a given repo, the commits in this list should
         # be in chronological order. Between different repos, there is no guarantee.
@@ -390,7 +412,6 @@ def analyze_test_id(name_group_commits):
         test_id = first_row['test_id']
         qtest_id = f"{network}_{upgrade}_{arch}_{platform}_{test_id}"
 
-        pos_for_missing_info = -100000000000
         for t in nurp_group.itertuples():
             source_locations = t.source_locations
             commits = list(t.commits)
@@ -403,40 +424,40 @@ def analyze_test_id(name_group_commits):
                     new_commit = CommitOutcomes(source_locations[idx], commit_id)
                     all_commits[new_commit.commit_id] = new_commit
 
-            # If the exact ordering of a commit is not known, preserve
-            # the ordering encountered in the incoming list.
-            def ordinal_for_commit(commit_id):
-                nonlocal pos_for_missing_info
-                ordinal = commits_ordinals.get(commit_id, pos_for_missing_info)
-                if ordinal < 0:
-                    pos_for_missing_info += 1
-                else:
-                    pass
-                return ordinal
+        # There is no guarantee that the order we observe commits being tested is the
+        # order in which they merged. Build a definitive order using information from github.
+        ordered_commits: List[str] = list(all_commits.keys())
 
-            commits.sort(key=ordinal_for_commit)
-            ordered_commits.extend(commits)
+        # If the exact ordering of a commit is not known, preserve
+        # the ordering encountered in the incoming list.
+        pos_for_missing_info = -100000000000
 
-            for idx in range(len(commits)):
-                commit_id = commits[idx]
-                new_commit = all_commits[commit_id]
-                source_location = new_commit.source_location
-                if source_location not in linked_commits:
-                    # Initial commit found for repo
-                    linked_commits[source_location] = new_commit
+        def ordinal_for_commit(commit_id):
+            nonlocal pos_for_missing_info
+            ordinal = commits_ordinals.get(commit_id, pos_for_missing_info)
+            if ordinal < 0:
+                pos_for_missing_info += 1
+            else:
+                pass
+            return ordinal
+
+        ordered_commits.sort(key=ordinal_for_commit)
+
+        linked: Set[str] = set()
+        linked_commits: Dict[SourceLocation, CommitOutcomes] = dict()
+        for commit_id in ordered_commits:
+            commit_to_update = all_commits[commit_id]
+            source_location = commit_to_update.source_location
+            if source_location not in linked_commits:
+                # Initial commit found for repo
+                linked_commits[source_location] = commit_to_update
+                linked.add(commit_id)
+            else:
+                if commit_id not in linked:
                     linked.add(commit_id)
-                else:
-                    if commit_id not in linked:
-                        linked.add(commit_id)
-                        new_commit.parent = linked_commits[source_location]
-                        linked_commits[source_location].child = new_commit
-                        linked_commits[source_location] = new_commit
-
-            # with pathlib.Path(f'{qtest_id}-commits.txt').open(mode='w+') as f:
-            #     for commit_sum in all_commits.values():
-            #         f.write(f'Commit {commit_sum.commit_id} in {commit_sum.source_location} has parent commit: {commit_sum.get_parent_commit_id()}\n')
-            #
-            # nurp_group.to_csv(f'{qtest_id}-nurp-tests.csv')
+                    commit_to_update.parent = linked_commits[source_location]
+                    linked_commits[source_location].child = commit_to_update
+                    linked_commits[source_location] = commit_to_update
 
         # Make a row for each test result against each commit.
         flattened_nurp_group = nurp_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
@@ -456,6 +477,7 @@ def analyze_test_id(name_group_commits):
         for t in flattened_nurp_group.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
+            modified_time = t.modified_time
             job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
 
             target_commit = all_commits[t.commits]
@@ -463,7 +485,7 @@ def analyze_test_id(name_group_commits):
                 target_commit.inform_ancestors_of_success_including_them(prowjob_url=job_link)
             else:
                 target_commit.inform_ancestors_of_failure_including_them(prowjob_url=job_link)
-            target_commit.inform_ancestors_of_failure_including_them(-1 * t.flake_count)
+            target_commit.inform_ancestors_of_failure_including_them(-1 * t.flake_count, prowjob_url=job_link)
 
 
         # For the "behind" aggregators, we want to prioritize successes/failures
@@ -497,7 +519,8 @@ def analyze_test_id(name_group_commits):
             )
 
         relevant_count = 0
-        by_le_grande_order = sorted(list(all_commits.values()), key=le_grande_order)
+        unresolved_regression: List[CommitOutcomes] = list()
+        by_le_grande_order: List[CommitOutcomes] = sorted(list(all_commits.values()), key=le_grande_order)
         for c in by_le_grande_order:
             # if c.fe_dynamic > -0.98:
             #     break
@@ -505,10 +528,17 @@ def analyze_test_id(name_group_commits):
             #     continue
             relevant_count += 1
             print(f'{c.fe_dynamic} -> {le_grande_order(c)}')
+            regressed, resolution = c.regression_info()
+            if regressed and not resolution:
+                unresolved_regression.append(c)
             print(c)
             print()
 
         print(f'Found {relevant_count}')
+        print(f'Found {len(unresolved_regression)} unresolved regressions')
+        for c in unresolved_regression:
+            print(c)
+            print()
 
 
 if __name__ == '__main__':
