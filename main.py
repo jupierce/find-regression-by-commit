@@ -198,50 +198,83 @@ class CommitOutcomes:
 
     @cached_property
     def worse_than_parent(self) -> bool:
-        return self.parent and self.parent.fe10 > self.fe10
+        if not self.parent:
+            return False
+        return self.parent.fe10 > self.fe10 or self.parent.fe20 > self.fe20 or self.parent.fe30 > self.fe30
+
+    @cached_property
+    def better_than_parent(self) -> bool:
+        if not self.parent:
+            return True
+        return not self.worse_than_parent
 
     def _behind_scan(self) -> Tuple[int, int]:
-        successes, failures = self.discrete_outcomes.success_count, self.discrete_outcomes.failure_count
+        successes = self.discrete_outcomes.success_count
+        failures = self.discrete_outcomes.failure_count
+
         if self.worse_than_parent:
-            # If I have a parent and their fe10 is better than or
-            # equal to my own.
-            p_successes, p_failures = self.parent._behind_scan()
-            successes += p_successes
-            failures += p_failures
+            node = self
+            while node.parent and node.worse_than_parent:  # traverse as a valley
+                successes += node.parent.discrete_outcomes.success_count
+                failures += node.parent.discrete_outcomes.failure_count
+                node = node.parent
+
+        else:
+            node = self
+            while node.parent and node.better_than_parent:
+                successes += node.parent.discrete_outcomes.success_count
+                failures += node.parent.discrete_outcomes.failure_count
+                node = node.parent
+
         return successes, failures
 
     @cached_property
     def behind_dynamic(self) -> OutcomePair:
-        bs = self._behind_scan()
+        successes, failures = self._behind_scan()
         behind = OutcomePair(-1, self.commit_id)
         # Looking behind us, we should not include our own successes/failures
-        behind.add_success(amount=bs[0] - self.discrete_outcomes.success_count)
-        behind.add_failure(amount=bs[1] - self.discrete_outcomes.failure_count)
+        behind.add_success(amount=successes - self.discrete_outcomes.success_count)
+        behind.add_failure(amount=failures - self.discrete_outcomes.failure_count)
         return behind
 
     @cached_property
     def worse_than_child(self) -> bool:
         # if a commit does not have a child, it is the last known commit
         # for a repo. Return True for childless so that it can be considered
-        # a peak.
+        # a valley.
+        if not self.child:
+            return True
         # Otherwise, return True only if the child fe is better than ours.
-        return (not self.child) or self.child.fe10 > self.fe10
+        return self.child.fe10 > self.fe10 or self.child.fe20 > self.fe20 or self.child.fe30 > self.fe30
+
+    @cached_property
+    def better_than_child(self) -> bool:
+        # if a commit does not have a child, it is the last known commit
+        # for a repo. Return True for childless so that it can be considered
+        # a peak.
+        if not self.child:
+            return True
+        # Otherwise, return True only if the child fe is worse than ours.
+        return not self.worse_than_child
 
     def _ahead_scan(self) -> Tuple[int, int]:
-        successes, failures = self.discrete_outcomes.success_count, self.discrete_outcomes.failure_count
+        successes = self.discrete_outcomes.success_count
+        failures = self.discrete_outcomes.failure_count
 
-        # If I have a child and their fe10 is better than mine, failures are tilted in
-        # this commit's direction. If child.fe10 happens to be equal
-        # to our own, we reason that the child failures are statistically
-        # worse because they include our own failures but have not
-        # begun to normalize. Thus the child is more likely to be the peak.
         if self.worse_than_child:
-            if self.child and self.child.fe10 <= 0:
-                # If the child also has a decline in signal, their results are
-                # going to be included in our dynamically sized fe.
-                c_successes, c_failures = self.child._ahead_scan()
-                successes += c_successes
-                failures += c_failures
+            node = self
+            while node.child and node.worse_than_child and node.child.fe10 <= 0:  # traverse as a valley
+                successes += node.child.discrete_outcomes.success_count
+                failures += node.child.discrete_outcomes.failure_count
+                node = node.child
+
+        else:
+            node = self
+            while node.child and node.better_than_child and node.child.fe10 >= 0:  # traverse as peak
+                successes += node.child.discrete_outcomes.success_count
+                failures += node.child.discrete_outcomes.failure_count
+                node = node.child
+
         return successes, failures
 
     @cached_property
@@ -252,8 +285,11 @@ class CommitOutcomes:
         ahead.add_failure(amount=failures)
         return ahead
 
-    def is_peak(self):
+    def is_valley(self):
         return self.worse_than_parent and self.worse_than_child
+
+    def is_peak(self):
+        return self.better_than_parent and self.better_than_child
 
     @cached_property
     def fe_dynamic(self):
@@ -264,6 +300,7 @@ class CommitOutcomes:
     def __str__(self):
         v = f'''Commit: {self.source_location}/commit/{self.commit_id}
 Peak: {self.is_peak()}
+Valley: {self.is_valley()}
 Discrete: {self.discrete_outcomes}
 10:
   behind10: {self.behind_10}        
@@ -435,10 +472,10 @@ def analyze_test_id(name_group_commits):
         relevant_count = 0
         by_le_grande_order = sorted(list(all_commits.values()), key=le_grande_order)
         for c in by_le_grande_order:
-            if c.fe_dynamic > -0.98:
-                break
-            if not c.is_peak():
-                continue
+            # if c.fe_dynamic > -0.98:
+            #     break
+            # if not c.is_valley():
+            #     continue
             relevant_count += 1
             print(f'{c.fe_dynamic} -> {le_grande_order(c)}')
             print(c)
