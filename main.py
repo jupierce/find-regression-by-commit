@@ -12,6 +12,7 @@ from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
 from functools import cached_property
 
+
 class WrappedInteger:
     def __init__(self, value=0):
         self._value = int(value)
@@ -33,12 +34,19 @@ class WrappedInteger:
         return self._value
 
 
+class ProwJobId(NamedTuple):
+    prowjob_name: str
+    prowjob_build_id: str
+    modified_time: datetime.datetime
+
+    def link(self) -> str:
+        return f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{self.prowjob_name}/{self.prowjob_build_id}'
+
+
 class ProwJobRun:
-    def __init__(self, commit_id, prowjob_name, prowjob_build_id, modified_time):
+    def __init__(self, commit_id, prowjob_id: ProwJobId):
         self.commit_id = commit_id
-        self.prowjob_name = prowjob_name
-        self.prowjob_build_id = prowjob_build_id
-        self.modified_name = modified_time
+        self.id = prowjob_id
         self.success_count = 0
         self.failure_count = 0
         self.flake_count = 0
@@ -60,23 +68,27 @@ class OutcomePair:
         self.failure_count = 0
         self.commit_id = commit_id
 
-        self.prowjob_urls: OrderedDict[str, str] = OrderedDict()
+        self.prowjobs: OrderedDict[ProwJobId, ProwJobRun] = OrderedDict()
 
-    def add_success(self, amount=1, prowjob_url: str = None):
+    def _get_prowjob_run(self, prowjob_id: ProwJobId) -> ProwJobRun:
+        if prowjob_id not in self.prowjobs:
+            self.prowjobs[prowjob_id] = ProwJobRun(self.commit_id, prowjob_id)
+        return self.prowjobs[prowjob_id]
+
+    def add_success(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
         if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
             self.success_count += amount
-            if prowjob_url:
-                self.prowjob_urls[prowjob_url] = 'S'
+            if prowjob_id:
+                self._get_prowjob_run(prowjob_id).add_success()
 
-    def add_failure(self, amount=1, prowjob_url: str = None):
+    def add_failure(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
         if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
             self.failure_count += amount
             if self.failure_count < 0:
                 # This can happen if we hit a flake_count > row, but datetime aligns us after the rows of the failures they account for.
                 self.failure_count = 0
-            if prowjob_url not in self.prowjob_urls:
-                # TODO: Success will take precedence. We are not tracking flakes.
-                self.prowjob_urls[prowjob_url] = 'F'
+            if prowjob_id:
+                self._get_prowjob_run(prowjob_id).add_failure(amount=amount)
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
@@ -150,30 +162,30 @@ class CommitOutcomes:
             return self.child.commit_id
         return None
 
-    def inform_children_of_success_behind_them(self, prowjob_url: str = None):
+    def inform_children_of_success_behind_them(self, prowjob_id: Optional[ProwJobId] = None):
         # Inform children of a success behind them
         node = self.child
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.behind_10.add_success(prowjob_url=prowjob_url)
-            node.behind_20.add_success(prowjob_url=prowjob_url)
-            node.behind_30.add_success(prowjob_url=prowjob_url)
+            node.behind_10.add_success(prowjob_id=prowjob_id)
+            node.behind_20.add_success(prowjob_id=prowjob_id)
+            node.behind_30.add_success(prowjob_id=prowjob_id)
             node = node.child
             count += 1
 
-    def inform_ancestors_of_success_including_them(self, prowjob_url: str = None):
+    def inform_ancestors_of_success_including_them(self, prowjob_id: Optional[ProwJobId] = None):
         # Inform parents and self of a success ahead of them
         node = self
-        self.discrete_outcomes.add_success(prowjob_url=prowjob_url)
+        self.discrete_outcomes.add_success(prowjob_id=prowjob_id)
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.ahead_10.add_success(prowjob_url=prowjob_url)
-            node.ahead_20.add_success(prowjob_url=prowjob_url)
-            node.ahead_30.add_success(prowjob_url=prowjob_url)
+            node.ahead_10.add_success(prowjob_id=prowjob_id)
+            node.ahead_20.add_success(prowjob_id=prowjob_id)
+            node.ahead_30.add_success(prowjob_id=prowjob_id)
             node = node.parent
             count += 1
 
-    def inform_children_of_failure_behind_them(self, amount=1, prowjob_url: str = None):
+    def inform_children_of_failure_behind_them(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
         if amount == 0:  # possible when decrementing flake_count and flake_count=0
             return
 
@@ -181,21 +193,21 @@ class CommitOutcomes:
         node = self.child
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.behind_10.add_failure(amount, prowjob_url=prowjob_url)
-            node.behind_20.add_failure(amount, prowjob_url=prowjob_url)
-            node.behind_30.add_failure(amount, prowjob_url=prowjob_url)
+            node.behind_10.add_failure(amount, prowjob_id=prowjob_id)
+            node.behind_20.add_failure(amount, prowjob_id=prowjob_id)
+            node.behind_30.add_failure(amount, prowjob_id=prowjob_id)
             node = node.child
             count += 1
 
-    def inform_ancestors_of_failure_including_them(self, amount=1, prowjob_url: str = None):
+    def inform_ancestors_of_failure_including_them(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
         # Inform parents and self of a failure ahead of them
         node = self
-        self.discrete_outcomes.add_failure(amount=amount, prowjob_url=prowjob_url)
+        self.discrete_outcomes.add_failure(amount=amount, prowjob_id=prowjob_id)
         count = 0
         while node is not None and count <= MAX_WINDOW_SIZE:
-            node.ahead_10.add_failure(amount, prowjob_url=prowjob_url)
-            node.ahead_20.add_failure(amount, prowjob_url=prowjob_url)
-            node.ahead_30.add_failure(amount, prowjob_url=prowjob_url)
+            node.ahead_10.add_failure(amount, prowjob_id=prowjob_id)
+            node.ahead_20.add_failure(amount, prowjob_id=prowjob_id)
+            node.ahead_30.add_failure(amount, prowjob_id=prowjob_id)
             node = node.parent
             count += 1
 
@@ -478,14 +490,14 @@ def analyze_test_id(name_group_commits):
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
             modified_time = t.modified_time
-            job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
+            prowjob_id = ProwJobId(prowjob_name=prowjob_name, prowjob_build_id=prowjob_build_id, modified_time=modified_time)
 
             target_commit = all_commits[t.commits]
             if t.success_val == 1:
-                target_commit.inform_ancestors_of_success_including_them(prowjob_url=job_link)
+                target_commit.inform_ancestors_of_success_including_them(prowjob_id=prowjob_id)
             else:
-                target_commit.inform_ancestors_of_failure_including_them(prowjob_url=job_link)
-            target_commit.inform_ancestors_of_failure_including_them(-1 * t.flake_count, prowjob_url=job_link)
+                target_commit.inform_ancestors_of_failure_including_them(prowjob_id=prowjob_id)
+            target_commit.inform_ancestors_of_failure_including_them(-1 * t.flake_count, prowjob_id=prowjob_id)
 
 
         # For the "behind" aggregators, we want to prioritize successes/failures
@@ -497,13 +509,14 @@ def analyze_test_id(name_group_commits):
         for t in flattened_nurp_group_reversed.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
-            job_link = f'https://prow.ci.openshift.org/view/gs/origin-ci-test/logs/{prowjob_name}/{prowjob_build_id}'
+            modified_time = t.modified_time
+            prowjob_id = ProwJobId(prowjob_name=prowjob_name, prowjob_build_id=prowjob_build_id, modified_time=modified_time)
 
             target_commit = all_commits[t.commits]
             if t.success_val == 1:
-                target_commit.inform_children_of_success_behind_them(prowjob_url=job_link)
+                target_commit.inform_children_of_success_behind_them(prowjob_id=prowjob_id)
             else:
-                target_commit.inform_children_of_failure_behind_them(prowjob_url=job_link)
+                target_commit.inform_children_of_failure_behind_them(prowjob_id=prowjob_id)
             target_commit.inform_children_of_failure_behind_them(-1 * t.flake_count)
 
         def le_grande_order(commit: CommitOutcomes):
