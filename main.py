@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import multiprocessing
 import datetime
+import traceback
 from typing import NamedTuple, List, Dict, Set, Tuple, Optional
+from enum import Enum
 import time
+
+import numpy
 import tqdm
 from collections import OrderedDict
 
@@ -11,6 +15,27 @@ import pandas
 from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
 from functools import cached_property
+
+import plotly.graph_objects as go
+
+
+class PayloadStreams(Enum):
+    CI_PAYLOAD = 'ci'
+    NIGHTLY_PAYLOAD = 'nightly'
+    PR_PAYLOAD = 'pr'
+
+    @staticmethod
+    def get_stream(release_name: str):
+        if '-0.ci-' in release_name:
+            return PayloadStreams.CI_PAYLOAD
+
+        if '-0.nightly-' in release_name:
+            return PayloadStreams.NIGHTLY_PAYLOAD
+
+        if '-0.ci.test-' in release_name:
+            return PayloadStreams.PR_PAYLOAD
+
+        return None
 
 
 class WrappedInteger:
@@ -136,6 +161,17 @@ class CommitOutcomes:
         self.behind_20: OutcomePair = OutcomePair(20, commit_id)
         self.behind_30: OutcomePair = OutcomePair(30, commit_id)
 
+        self.release_streams: Dict[PayloadStreams, OrderedDict[str, bool]] = {
+            PayloadStreams.NIGHTLY_PAYLOAD: OrderedDict(),  # We really just want an Ordered Set. Value doesn't matter.
+            PayloadStreams.CI_PAYLOAD: OrderedDict(),
+            PayloadStreams.PR_PAYLOAD: OrderedDict()
+        }
+
+    def record_observation_in_release(self, release_name: str):
+        stream_name = PayloadStreams.get_stream(release_name)
+        if stream_name:
+            self.release_streams[stream_name][release_name] = True
+
     def get_ancestor_ids(self) -> List[str]:
         ancestors_commit_ids = []
         node = self.parent
@@ -173,7 +209,7 @@ class CommitOutcomes:
             node = node.child
             count += 1
 
-    def inform_ancestors_of_success_including_them(self, prowjob_id: Optional[ProwJobId] = None):
+    def inform_ancestors_and_self_of_success_including_them(self, prowjob_id: Optional[ProwJobId] = None):
         # Inform parents and self of a success ahead of them
         node = self
         self.discrete_outcomes.add_success(prowjob_id=prowjob_id)
@@ -199,7 +235,7 @@ class CommitOutcomes:
             node = node.child
             count += 1
 
-    def inform_ancestors_of_failure_including_them(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
+    def inform_ancestors_and_self_of_failure_including_them(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
         # Inform parents and self of a failure ahead of them
         node = self
         self.discrete_outcomes.add_failure(amount=amount, prowjob_id=prowjob_id)
@@ -233,7 +269,7 @@ class CommitOutcomes:
     def worse_than_parent(self) -> bool:
         if not self.parent:
             return False
-        return self.parent.fe10 > self.fe10 or self.parent.fe20 > self.fe20 or self.parent.fe30 > self.fe30
+        return self.parent.fe30 > self.fe30
 
     @cached_property
     def better_than_parent(self) -> bool:
@@ -278,7 +314,7 @@ class CommitOutcomes:
         if not self.child:
             return True
         # Otherwise, return True only if the child fe is better than ours.
-        return self.child.fe10 > self.fe10 or self.child.fe20 > self.fe20 or self.child.fe30 > self.fe30
+        return self.child.fe30 > self.fe30
 
     @cached_property
     def better_than_child(self) -> bool:
@@ -338,7 +374,7 @@ class CommitOutcomes:
             resolving_outcome = None
             node = self.child
             while node:
-                if node.is_peak():
+                if node.fe10 >= 0:  # If there is a commit causing the pass rate to increase or to have stabilized, see if it resolves us.
                     resolution_fe = node.ahead_30.fishers_exact(self.behind_30)
                     if resolution_fe >= -0.5:  # If the signal has improved or is close to statistically insignificant.
                         # We've found a peak in front of our valley. Ahead of it
@@ -411,10 +447,6 @@ def analyze_test_id(name_group_commits):
         # use the order in which commits are observed as a heuristic for parent/child links.
         all_commits: OrderedDict[CommitId, CommitOutcomes] = OrderedDict()
 
-        # Contains a list of all commits. Within a given repo, the commits in this list should
-        # be in chronological order. Between different repos, there is no guarantee.
-        ordered_commits = list()
-
         first_row = nurp_group.iloc[0]
         test_name = first_row['test_name']
         network = first_row['network']
@@ -435,6 +467,7 @@ def analyze_test_id(name_group_commits):
                 if commit_id not in all_commits:
                     new_commit = CommitOutcomes(source_locations[idx], commit_id)
                     all_commits[new_commit.commit_id] = new_commit
+                all_commits[commit_id].record_observation_in_release(t.release_name)
 
         # There is no guarantee that the order we observe commits being tested is the
         # order in which they merged. Build a definitive order using information from github.
@@ -475,7 +508,54 @@ def analyze_test_id(name_group_commits):
         flattened_nurp_group = nurp_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
         ordered_commits = list(dict.fromkeys(ordered_commits))  # fast way to remove dupes while preserving order: https://stackoverflow.com/a/17016257
         flattened_nurp_group['commits'] = pandas.Categorical(flattened_nurp_group['commits'], ordered_commits)  # When subsequently sorted, this will sort the entries by their location in the ordered_commits
-        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], inplace=True)
+
+        # Consider a list of test results ordered first by commit history
+        # (in our test results, commit order is only guaranteed for a given
+        # repo, so in the following example, A -> B -> C are all from the
+        # same repo) and then by time at which the test run was observed:
+        #    commitA
+        #       test result tA+0
+        #       test result tA+1
+        #       ...
+        #       test result tA+M
+        #    commitB
+        #       test result tB+0
+        #       test result tB+1
+        #       ...
+        #       test result tB+N
+        #    commitC
+        #       test result tC+0
+        #       test result tC+1
+        #       ...
+        #       test result tC+O
+        #
+        # Note that since tests can occur for a given commit at any time in our scan window,
+        # there is no guarantee that, for example, all tA times are greater than tB times.
+        #
+        # Assuming that we iterate forward through these results to populate the commit
+        # aggregators (i.e. ahead and behind successes/failures), this ordering is not
+        # ideal.
+        #
+        # 1. When informing self about successes/failures ahead, we want to prioritize the
+        #    results of tB+N for commitB because it represents the most recent test
+        #    results. This is important because if we devise a system that triggers
+        #    test runs to help ferret out real regressions vs likely regression commits
+        #    then these will happen later in chronological time. We want to give
+        #    then priority so that they impact our FE values instead of being ignored
+        #    because we already had fe30 accumulators filled up from tB+0, ....
+        # 2. When informing ancestors about successes/failures ahead, we also want
+        #    to include the latest test runs first -- for the same reason.
+        # 3. When informing children of success, the above ordering would lead commitA's
+        #    test runs to be contributed to commitC's behind accumulator before commitB's.
+        #    Obviously, the results of the parent commitB are more pertinent to commitC,
+        #    so we need to inform children by processing commits in reverse order of
+        #    commit history. As with (1) and (2), newer results should be preferred.
+
+        # We are about to process test results for self+ancestors. See long comment
+        # above about why commits are ascending order (order of commit history within
+        # a given repo) and modified_time (test run time) is descending (reverse
+        # chronological).
+        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], ascending=[True, False], inplace=True)
 
         # Within a release payload, a commit may be encountered multiple times: one
         # for each component it is associated with (e.g. openshift/oc is associated with
@@ -484,8 +564,7 @@ def analyze_test_id(name_group_commits):
         # 4x count it. Convert the commits into a set to dedupe.
         flattened_nurp_group.drop_duplicates(inplace=True)
 
-        # Iterate through again to cuckoo the test outcomes back and forth
-        # through the commit graph for each repo.
+        # Iterate through to accumulate "ahead" results for self + ancestors.
         for t in flattened_nurp_group.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
@@ -494,19 +573,18 @@ def analyze_test_id(name_group_commits):
 
             target_commit = all_commits[t.commits]
             if t.success_val == 1:
-                target_commit.inform_ancestors_of_success_including_them(prowjob_id=prowjob_id)
+                target_commit.inform_ancestors_and_self_of_success_including_them(prowjob_id=prowjob_id)
             else:
-                target_commit.inform_ancestors_of_failure_including_them(prowjob_id=prowjob_id)
-            target_commit.inform_ancestors_of_failure_including_them(-1 * t.flake_count, prowjob_id=prowjob_id)
+                target_commit.inform_ancestors_and_self_of_failure_including_them(prowjob_id=prowjob_id)
+            target_commit.inform_ancestors_and_self_of_failure_including_them(-1 * t.flake_count, prowjob_id=prowjob_id)
 
 
-        # For the "behind" aggregators, we want to prioritize successes/failures
-        # as close to the introduction of the commit as possible. Reversing the
-        # nurp puts modified_time in DESC order (backwards in time).
-        # Without this reversal, old ancestors will fill up a commit's
-        # max aggregation value before newer/closer ancestor results.
-        flattened_nurp_group_reversed = flattened_nurp_group.iloc[::-1]
-        for t in flattened_nurp_group_reversed.itertuples():
+        # We are about to process test results for children. See long comment
+        # above about why commits are descending order (reverse of commit history within
+        # a given repo) and modified_time (test run time) is descending (reverse
+        # chronological).
+        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], ascending=[False, False], inplace=True)
+        for t in flattened_nurp_group.itertuples():
             prowjob_name = t.prowjob_name
             prowjob_build_id = t.prowjob_build_id
             modified_time = t.modified_time
@@ -553,12 +631,64 @@ def analyze_test_id(name_group_commits):
             print(c)
             print()
 
+        z = []
+        release_names: OrderedDict[str, bool] = OrderedDict()  # y axis
+        source_locations = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
+        for t in nurp_group.itertuples():
+            if PayloadStreams.get_stream(t.release_name) != PayloadStreams.NIGHTLY_PAYLOAD:
+                continue
+
+            release_names[t.release_name] = True
+            if not source_locations:
+                source_locations = sorted(list(t.source_locations))
+
+            commit_outcomes: List[CommitOutcomes] = list()
+            for commit_id in t.commits:
+                commit_outcomes.append(all_commits[commit_id])
+
+            # We need to take care to tolerate if there are new / missing source locations,
+            # but this should be exceedingly rare.
+            commit_outcomes_by_source_location = {commit.source_location: commit for commit in commit_outcomes}
+
+            z_entry = [t.release_name]
+            for source_location in source_locations:
+                c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
+                if c:
+                    # z_entry.append(c.fe_dynamic)
+                    z_entry.append(f'g{c.commit_id[:5]}:t{c.fe_dynamic}')
+                else:
+                    # z_entry.append(0.0)
+                    z_entry.append('?')
+
+            z.append(z_entry)
+
+        pandas.DataFrame(z).to_csv('what.csv', index_label=source_locations)
+
+
+        try:
+            fig = go.Figure(data=[go.Surface(z=z, x=source_locations, y=list(release_names.keys()))])
+            fig.update_layout(title='Mt Bruno Elevation',
+                              autosize=False,
+                              xaxis=dict(
+                                  tickmode='auto',
+                                  nticks=len(source_locations),
+                              ),
+                              yaxis=dict(
+                                  tickmode='auto',
+                                  nticks=len(release_names),
+                              ),
+                              width=1200, height=1200,
+                              margin=dict(l=65, r=50, b=65, t=90))
+            fig.show()
+        except Exception as e:
+            traceback.print_exc()
+
 
 if __name__ == '__main__':
     scan_period_days = 14  # days
     # before_datetime = datetime.datetime.utcnow()
-    # TODO: REMOVE subtraction in before_datetime to prevent searching in the past
-    before_datetime = datetime.datetime.utcnow() - datetime.timedelta(days=scan_period_days)
+    # TODO: REMOVE fixed date after testing
+    before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
     before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S")
     after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S")
@@ -689,7 +819,6 @@ if __name__ == '__main__':
                         AND test_name NOT LIKE "%disruption%"
                         AND platform LIKE "{LIMIT_PLATFORM}" 
                         AND upgrade LIKE "{LIMIT_UPGRADE}" 
-                # IGNORE TESTING FROM PRs for the time being.
                 UNION ALL    
     
                 # Find all junit tests run in PR triggered tests which ran as part of those prowjobs over the last two months
