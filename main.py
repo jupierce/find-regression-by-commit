@@ -19,6 +19,11 @@ from functools import cached_property
 import plotly.graph_objects as go
 
 
+class Mode(Enum):
+    DETECT_CURRENT = 0  # Prefer new test results against a commit to old.
+    ANALYZE_PAST = 1
+
+
 class PayloadStreams(Enum):
     CI_PAYLOAD = 'ci'
     NIGHTLY_PAYLOAD = 'nightly'
@@ -87,33 +92,11 @@ class ProwJobRun:
 
 class OutcomePair:
 
-    def __init__(self, max_records: int, commit_id):
-        self.max_records = max_records
-        self.success_count = 0
-        self.failure_count = 0
+    def __init__(self, commit_id, success_count: int, failure_count: int, flake_count: int):
+        self.success_count = success_count
+        self.failure_count = failure_count
+        self.flake_count = flake_count
         self.commit_id = commit_id
-
-        self.prowjobs: OrderedDict[ProwJobId, ProwJobRun] = OrderedDict()
-
-    def _get_prowjob_run(self, prowjob_id: ProwJobId) -> ProwJobRun:
-        if prowjob_id not in self.prowjobs:
-            self.prowjobs[prowjob_id] = ProwJobRun(self.commit_id, prowjob_id)
-        return self.prowjobs[prowjob_id]
-
-    def add_success(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
-        if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
-            self.success_count += amount
-            if prowjob_id:
-                self._get_prowjob_run(prowjob_id).add_success()
-
-    def add_failure(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
-        if self.max_records == -1 or self.success_count + self.failure_count < self.max_records:
-            self.failure_count += amount
-            if self.failure_count < 0:
-                # This can happen if we hit a flake_count > row, but datetime aligns us after the rows of the failures they account for.
-                self.failure_count = 0
-            if prowjob_id:
-                self._get_prowjob_run(prowjob_id).add_failure(amount=amount)
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
@@ -136,6 +119,20 @@ class OutcomePair:
 
         return 0.0
 
+    def mlog10Test1t(self, result_sum2) -> float:
+        if result_sum2.pass_rate() > self.pass_rate():
+            return -1 * fast_fisher_cython.mlog10Test1t(
+                self.failure_count, self.success_count,
+                result_sum2.failure_count, result_sum2.success_count
+            )
+        elif self.pass_rate() > result_sum2.pass_rate():
+            # If there has been improvement
+            return fast_fisher_cython.mlog10Test1t(
+                self.failure_count, self.success_count,
+                result_sum2.failure_count, result_sum2.success_count
+            )
+        return 0.0
+
     def __str__(self):
         return f'[s={self.success_count} f={self.failure_count} r={int(self.pass_rate() * 100)}%]'
 
@@ -145,27 +142,48 @@ MAX_WINDOW_SIZE = 30
 
 class CommitOutcomes:
 
-    def __init__(self, source_location: str, commit_id: str, parent_commit_sums=None, child_commit_sums=None):
+    def __init__(self, source_location: str, commit_id: str, created_at: Optional[pandas.Timestamp]):
         self.source_location = source_location
         self.commit_id = commit_id
-        self.parent = parent_commit_sums
-        self.child = child_commit_sums
+        self.created_at = created_at
+        self.parent = None
+        self.child = None
 
-        self.discrete_outcomes = OutcomePair(-1, commit_id)  # Tests run against exactly this commit.
+        self.behind_records: Optional[pandas.DataFrame] = None
 
-        self.ahead_10: OutcomePair = OutcomePair(10, commit_id)
-        self.ahead_20: OutcomePair = OutcomePair(20, commit_id)
-        self.ahead_30: OutcomePair = OutcomePair(30, commit_id)
+        self.ahead_records: Optional[pandas.DataFrame] = None
 
-        self.behind_10: OutcomePair = OutcomePair(10, commit_id)
-        self.behind_20: OutcomePair = OutcomePair(20, commit_id)
-        self.behind_30: OutcomePair = OutcomePair(30, commit_id)
+        self.ahead_records_chron: Optional[pandas.DataFrame] = None  # will be set to ahead records, but secondary sort of time run time.
+
+        self.discrete_outcomes: Optional[OutcomePair] = None
 
         self.release_streams: Dict[PayloadStreams, OrderedDict[str, bool]] = {
             PayloadStreams.NIGHTLY_PAYLOAD: OrderedDict(),  # We really just want an Ordered Set. Value doesn't matter.
             PayloadStreams.CI_PAYLOAD: OrderedDict(),
             PayloadStreams.PR_PAYLOAD: OrderedDict()
         }
+
+    def set_data(self, behind_records: pandas.DataFrame, ahead_records: pandas.DataFrame):
+        self.behind_records = behind_records.loc[behind_records['source_locations'] == self.source_location]
+        self.behind_records = self.behind_records.reset_index(drop=True)  # Order records 0... so we can lop off after a specific index.
+        # Note that for behind_records, tests are ordered in order of reverse git merge.
+        first_behind_index_of_commit = self.behind_records.commits.where(self.behind_records.commits == self.commit_id).last_valid_index()
+        self.behind_records = self.behind_records.iloc[first_behind_index_of_commit+1:]  # We don't want to our tests results or those of our children in the behind view
+
+        self.ahead_records = ahead_records.loc[ahead_records['source_locations'] == self.source_location]
+        self.ahead_records = self.ahead_records.reset_index(drop=True)  # Order records 0... so we can lop off before a specific index.
+        first_ahead_index_of_commit = self.ahead_records.commits.where(self.ahead_records.commits == self.commit_id).first_valid_index()
+        self.ahead_records = self.ahead_records.iloc[first_ahead_index_of_commit:]  # We don't need to keep any test records from before we arrived for look ahead
+
+        tests_against_this_commit = self.ahead_records[self.ahead_records['commits'] == self.commit_id]
+        self.discrete_outcomes = self.outcome_sums(tests_against_this_commit)
+        self.ahead_records_chron = self.ahead_records.sort_values(by=['commits', 'modified_time'], ascending=[True, True], inplace=False)
+
+        if self.created_at is None:
+            # If we don't know when the commit has created using github information, then
+            # approximate by the first release to test the commit.
+            self.created_at = pandas.Timestamp(self.ahead_records_chron[self.ahead_records_chron['commits'] == self.commit_id].iloc[0].release_created, tz='UTC')
+            pass
 
     def record_observation_in_release(self, release_name: str):
         stream_name = PayloadStreams.get_stream(release_name)
@@ -198,58 +216,71 @@ class CommitOutcomes:
             return self.child.commit_id
         return None
 
-    def inform_children_of_success_behind_them(self, prowjob_id: Optional[ProwJobId] = None):
-        # Inform children of a success behind them
-        node = self.child
-        count = 0
-        while node is not None and count <= MAX_WINDOW_SIZE:
-            node.behind_10.add_success(prowjob_id=prowjob_id)
-            node.behind_20.add_success(prowjob_id=prowjob_id)
-            node.behind_30.add_success(prowjob_id=prowjob_id)
-            node = node.child
-            count += 1
+    def outcome_sums(self, selection: pandas.DataFrame) -> OutcomePair:
+        test_runs = len(selection)
+        if test_runs > 0:
+            success_count = selection['success_val'].sum()
+            flake_count = selection['flake_count'].sum()
+        else:
+            # No tests have been run against this commit
+            success_count = 0
+            flake_count = 0
 
-    def inform_ancestors_and_self_of_success_including_them(self, prowjob_id: Optional[ProwJobId] = None):
-        # Inform parents and self of a success ahead of them
-        node = self
-        self.discrete_outcomes.add_success(prowjob_id=prowjob_id)
-        count = 0
-        while node is not None and count <= MAX_WINDOW_SIZE:
-            node.ahead_10.add_success(prowjob_id=prowjob_id)
-            node.ahead_20.add_success(prowjob_id=prowjob_id)
-            node.ahead_30.add_success(prowjob_id=prowjob_id)
-            node = node.parent
-            count += 1
+        failure_count = test_runs - success_count - flake_count
+        if failure_count < 0:
+            # Rare case where the window of our select catches a flake but not the error record
+            # it is trying to account for.
+            failure_count = 0
 
-    def inform_children_of_failure_behind_them(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
-        if amount == 0:  # possible when decrementing flake_count and flake_count=0
-            return
+        return OutcomePair(self.commit_id, success_count=success_count, failure_count=failure_count, flake_count=flake_count)
 
-        # Inform children of a failure behind them
-        node = self.child
-        count = 0
-        while node is not None and count <= MAX_WINDOW_SIZE:
-            node.behind_10.add_failure(amount, prowjob_id=prowjob_id)
-            node.behind_20.add_failure(amount, prowjob_id=prowjob_id)
-            node.behind_30.add_failure(amount, prowjob_id=prowjob_id)
-            node = node.child
-            count += 1
+    def ahead(self, count: int, before_date: Optional[numpy.datetime64] = None) -> pandas.DataFrame:
+        outcomes: Optional[pandas.DataFrame] = None
 
-    def inform_ancestors_and_self_of_failure_including_them(self, amount=1, prowjob_id: Optional[ProwJobId] = None):
-        # Inform parents and self of a failure ahead of them
-        node = self
-        self.discrete_outcomes.add_failure(amount=amount, prowjob_id=prowjob_id)
-        count = 0
-        while node is not None and count <= MAX_WINDOW_SIZE:
-            node.ahead_10.add_failure(amount, prowjob_id=prowjob_id)
-            node.ahead_20.add_failure(amount, prowjob_id=prowjob_id)
-            node.ahead_30.add_failure(amount, prowjob_id=prowjob_id)
-            node = node.parent
-            count += 1
+        if before_date:
+            # If before_date is being used, the caller cares about specific time periods, so we
+            # use ahead_records_chron. Unlike normal ahead calls, this means we will not
+            # prefer new test results over old.
+            outcomes = self.ahead_records_chron[(self.ahead_records_chron['modified_time'] < before_date)]
+            if count > -1:
+                if len(outcomes) >= count:
+                    outcomes = outcomes[:count]
+                else:
+                    # Not enough results before date, ignore date.
+                    outcomes = self.ahead_records_chron.iloc[:count]
+
+        if outcomes is None:
+            outcomes = self.ahead_records.iloc[:count]
+
+        return outcomes
+
+    def ahead_outcome(self, count: int, before_date: Optional[numpy.datetime64] = None) -> OutcomePair:
+        """
+        :param count: The desired number of test results to analyze. -1 for unlimited.
+        :param before_date: Constrain to results before date. Unless count >-1 is specified in which case if there are
+                            too few results before the date.
+        :return:
+        """
+        return self.outcome_sums(self.ahead(count=count, before_date=before_date))
+
+    def behind_outcome(self, count: Optional[int] = None, after_date: Optional[numpy.datetime64] = None) -> OutcomePair:
+        if count is None and after_date is None:
+            count = 10
+
+        if count:
+            filtered = self.behind_records.iloc[:count]
+            return self.outcome_sums(filtered)
+        else:
+            filtered = self.behind_records[self.behind_records['modified_time'] > after_date]
+            return self.outcome_sums(filtered)
 
     @cached_property
     def fe10(self):
-        return self.ahead_10.fishers_exact(self.behind_10)
+        return self.ahead_outcome(count=10).fishers_exact(self.behind_outcome(count=10))
+
+    @cached_property
+    def mlog10p_10(self):
+        return self.ahead_outcome(count=10).mlog10Test1t(self.behind_outcome(count=10))
 
     @cached_property
     def fe10_incoming_slope(self):
@@ -259,11 +290,19 @@ class CommitOutcomes:
 
     @cached_property
     def fe20(self):
-        return self.ahead_20.fishers_exact(self.behind_20)
+        return self.ahead_outcome(count=20).fishers_exact(self.behind_outcome(count=20))
+
+    @cached_property
+    def mlog10p_20(self):
+        return self.ahead_outcome(count=20).mlog10Test1t(self.behind_outcome(count=20))
 
     @cached_property
     def fe30(self):
-        return self.ahead_30.fishers_exact(self.behind_30)
+        return self.ahead_outcome(count=30).fishers_exact(self.behind_outcome(count=30))
+
+    @cached_property
+    def mlog10p_30(self):
+        return self.ahead_outcome(count=30).mlog10Test1t(self.behind_outcome(count=30))
 
     @cached_property
     def worse_than_parent(self) -> bool:
@@ -369,13 +408,12 @@ class CommitOutcomes:
                     The second element of the Tuple is a commit outcomes the system believes resolved
                     the regression. None if the regression is still active.
         """
-        if self.fe_dynamic < -0.98 and self.is_valley():
+        if self.fe10 < -0.95 and self.is_valley():
             # Qualifies as regression.
-            resolving_outcome = None
             node = self.child
             while node:
                 if node.fe10 >= 0:  # If there is a commit causing the pass rate to increase or to have stabilized, see if it resolves us.
-                    resolution_fe = node.ahead_30.fishers_exact(self.behind_30)
+                    resolution_fe = node.ahead_outcome(count=30).fishers_exact(self.behind_outcome(count=30))
                     if resolution_fe >= -0.5:  # If the signal has improved or is close to statistically insignificant.
                         # We've found a peak in front of our valley. Ahead of it
                         # and behind us look very similar statistically. Assume
@@ -394,26 +432,21 @@ class CommitOutcomes:
 
     def __str__(self):
         v = f'''Commit: {self.github_link()}
+Created: {self.created_at}
 Peak: {self.is_peak()}
 Valley: {self.is_valley()}
 Discrete: {self.discrete_outcomes}
 Regression Info: {self.regression_info()}
 10:
-  behind10: {self.behind_10}        
-  ahead10: {self.ahead_10}
-  fe10: {self.fe10}
+  fe10: {self.mlog10p_10}
 20:
-  behind10: {self.behind_20}        
-  ahead10: {self.ahead_20}
-  fe20: {self.fe20}
+  fe20: {self.mlog10p_20}
 30:
-  behind30: {self.behind_30}        
-  ahead30: {self.ahead_30}
-  fe30: {self.fe30}
+  fe30: {self.mlog10p_30}
 dynamic:
-  behind: {self.behind_dynamic}
-  ahead: {self.ahead_dynamic}
-  fe: {self.fe_dynamic}
+  behind: {{self.behind_dynamic}}
+  ahead: {{self.ahead_dynamic}}
+  fe: {{self.fe_dynamic}}
 '''
         if self.parent:
             v += f'Parent: {self.parent.commit_id}\n'
@@ -425,6 +458,8 @@ dynamic:
 SourceLocation = str
 CommitId = str
 
+
+OPERATING_MODE = Mode.ANALYZE_PAST
 INCLUDE_PR_TESTS = True
 LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = 'ovn'
@@ -465,7 +500,8 @@ def analyze_test_id(name_group_commits):
             for idx in range(len(commits)):
                 commit_id = commits[idx]
                 if commit_id not in all_commits:
-                    new_commit = CommitOutcomes(source_locations[idx], commit_id)
+                    created_at = commits_ordinals.get(commit_id, (None,None))[1]
+                    new_commit = CommitOutcomes(source_locations[idx], commit_id, created_at=created_at)
                     all_commits[new_commit.commit_id] = new_commit
                 all_commits[commit_id].record_observation_in_release(t.release_name)
 
@@ -479,8 +515,8 @@ def analyze_test_id(name_group_commits):
 
         def ordinal_for_commit(commit_id):
             nonlocal pos_for_missing_info
-            ordinal = commits_ordinals.get(commit_id, pos_for_missing_info)
-            if ordinal < 0:
+            ordinal = commits_ordinals.get(commit_id, (pos_for_missing_info,))
+            if ordinal[0] < 0:
                 pos_for_missing_info += 1
             else:
                 pass
@@ -508,6 +544,9 @@ def analyze_test_id(name_group_commits):
         flattened_nurp_group = nurp_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
         ordered_commits = list(dict.fromkeys(ordered_commits))  # fast way to remove dupes while preserving order: https://stackoverflow.com/a/17016257
         flattened_nurp_group['commits'] = pandas.Categorical(flattened_nurp_group['commits'], ordered_commits)  # When subsequently sorted, this will sort the entries by their location in the ordered_commits
+
+        # Restore source_locations into newly flattend dataframe. Each commit now has exactly one source location in its row.
+        flattened_nurp_group['source_locations'] = flattened_nurp_group.apply(lambda x: all_commits[x.commits].source_location, axis=1)
 
         # Consider a list of test results ordered first by commit history
         # (in our test results, commit order is only guaranteed for a given
@@ -555,7 +594,7 @@ def analyze_test_id(name_group_commits):
         # above about why commits are ascending order (order of commit history within
         # a given repo) and modified_time (test run time) is descending (reverse
         # chronological).
-        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], ascending=[True, False], inplace=True)
+        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], ascending=[True, OPERATING_MODE == Mode.ANALYZE_PAST], inplace=True)
 
         # Within a release payload, a commit may be encountered multiple times: one
         # for each component it is associated with (e.g. openshift/oc is associated with
@@ -563,50 +602,28 @@ def analyze_test_id(name_group_commits):
         # count an individual success/failure against the oc commit, or we will
         # 4x count it. Convert the commits into a set to dedupe.
         flattened_nurp_group.drop_duplicates(inplace=True)
-
-        # Iterate through to accumulate "ahead" results for self + ancestors.
-        for t in flattened_nurp_group.itertuples():
-            prowjob_name = t.prowjob_name
-            prowjob_build_id = t.prowjob_build_id
-            modified_time = t.modified_time
-            prowjob_id = ProwJobId(prowjob_name=prowjob_name, prowjob_build_id=prowjob_build_id, modified_time=modified_time)
-
-            target_commit = all_commits[t.commits]
-            if t.success_val == 1:
-                target_commit.inform_ancestors_and_self_of_success_including_them(prowjob_id=prowjob_id)
-            else:
-                target_commit.inform_ancestors_and_self_of_failure_including_them(prowjob_id=prowjob_id)
-            target_commit.inform_ancestors_and_self_of_failure_including_them(-1 * t.flake_count, prowjob_id=prowjob_id)
-
+        ahead_test_records = flattened_nurp_group
 
         # We are about to process test results for children. See long comment
         # above about why commits are descending order (reverse of commit history within
         # a given repo) and modified_time (test run time) is descending (reverse
         # chronological).
-        flattened_nurp_group.sort_values(by=['commits', 'modified_time'], ascending=[False, False], inplace=True)
-        for t in flattened_nurp_group.itertuples():
-            prowjob_name = t.prowjob_name
-            prowjob_build_id = t.prowjob_build_id
-            modified_time = t.modified_time
-            prowjob_id = ProwJobId(prowjob_name=prowjob_name, prowjob_build_id=prowjob_build_id, modified_time=modified_time)
+        behind_test_records = flattened_nurp_group.sort_values(by=['commits', 'modified_time'], ascending=[False, OPERATING_MODE == Mode.ANALYZE_PAST], inplace=False)
 
-            target_commit = all_commits[t.commits]
-            if t.success_val == 1:
-                target_commit.inform_children_of_success_behind_them(prowjob_id=prowjob_id)
-            else:
-                target_commit.inform_children_of_failure_behind_them(prowjob_id=prowjob_id)
-            target_commit.inform_children_of_failure_behind_them(-1 * t.flake_count)
+        for commit_outcome in all_commits.values():
+            commit_outcome.set_data(behind_test_records, ahead_test_records)
 
         def le_grande_order(commit: CommitOutcomes):
             # Returning a tuple means order by first attribute, then next, then..
             return (
-                commit.fe_dynamic,
-                commit.fe10_incoming_slope,
-                commit.discrete_outcomes.pass_rate(),
-                -1 * commit.ahead_dynamic.failure_count,
-                commit.fe10,
-                commit.fe20,
-                commit.fe30,
+                #commit.fe_dynamic,
+                #commit.fe10_incoming_slope,
+                #commit.discrete_outcomes.pass_rate(),
+                #-1 * commit.ahead_dynamic.failure_count,
+                commit.mlog10p_10,
+                commit.mlog10p_20,
+                commit.mlog10p_30,
+                commit.created_at,  # Resolve disputes with the assumption that the first to merge caused the issue.
             )
 
         relevant_count = 0
@@ -618,10 +635,10 @@ def analyze_test_id(name_group_commits):
             # if not c.is_valley():
             #     continue
             relevant_count += 1
-            print(f'{c.fe_dynamic} -> {le_grande_order(c)}')
-            regressed, resolution = c.regression_info()
-            if regressed and not resolution:
-                unresolved_regression.append(c)
+            print(f'{le_grande_order(c)}')
+            # regressed, resolution = c.regression_info()
+            # if regressed and not resolution:
+            #     unresolved_regression.append(c)
             print(c)
             print()
 
@@ -654,10 +671,10 @@ def analyze_test_id(name_group_commits):
             for source_location in source_locations:
                 c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
                 if c:
-                    # z_entry.append(c.fe_dynamic)
-                    z_entry.append(f'g{c.commit_id[:5]}:t{c.fe_dynamic}')
+                    #z_entry.append(c.mlog10p_10)
+                    z_entry.append(f'g{c.commit_id[:5]}:t{c.mlog10p_10}')
                 else:
-                    # z_entry.append(0.0)
+                    #z_entry.append(0.0)
                     z_entry.append('?')
 
             z.append(z_entry)
@@ -764,12 +781,12 @@ if __name__ == '__main__':
                 # Missing multiple days in github archive?
                 raise
 
-    commits_ordinals: Dict[str, int] = dict()
+    commits_ordinals: Dict[str, Tuple[int, datetime.datetime]] = dict()
     # Create a dict mapping each commit to an increasing integer. This will allow more
     # efficient lookup later when we need to know whether one commit came after another.
     count = 0
     for row in commits_info.itertuples():
-        commits_ordinals[row.commit] = count
+        commits_ordinals[row.commit] = (count, row.created_at)
         count += 1
 
     for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
