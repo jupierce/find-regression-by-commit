@@ -17,13 +17,14 @@ from fast_fisher import fast_fisher_cython
 from functools import cached_property
 
 import plotly.graph_objects as go
+import plotly.express as px
 
 pandas.options.compute.use_numexpr = True
 
 
 class Mode(Enum):
-    DETECT_CURRENT = 0  # Prefer new test results against a commit to old.
-    ANALYZE_PAST = 1
+    PRIORITIZE_NEWEST_TEST_RESULTS = 0  # Useful if we are triggering new tests to evaluate signal or want to see if a signal is falling
+    PRIORITIZE_ORIGINAL_TEST_RESULTS = 1
 
 
 class PayloadStreams(Enum):
@@ -151,15 +152,9 @@ class CommitOutcomes:
         self.parent = None
         self.child = None
 
-        self.behind_records: Optional[pandas.DataFrame] = None
-        self.index_last_self_test_in_behind_records = 0
-        self.index_after_last_self_test_in_behind_records = 0
-
-        self.ahead_records: Optional[pandas.DataFrame] = None
-        self.index_first_self_test_in_ahead_records = 0
-
-        self.ahead_records_chron: Optional[pandas.DataFrame] = None  # will be set to ahead records, but secondary sort of time run time.
-        self.index_first_self_test_in_ahead_records_chron = 0
+        self.repo_test_records: Optional[pandas.DataFrame] = None
+        self.index_first_self_test_in_records = 0
+        self.index_last_self_test_in_records = 0
 
         self.discrete_outcomes: Optional[OutcomePair] = None
 
@@ -169,55 +164,14 @@ class CommitOutcomes:
             PayloadStreams.PR_PAYLOAD: OrderedDict()
         }
 
-    def get_ahead_records_chron(self):
-        # Lazily prepare chron order only if is it needed.
-        if self.ahead_records_chron is None:
-            self.ahead_records_chron = self.ahead_records.sort_values(by=['commits', 'modified_time'],
-                                                                      ascending=[True, True],
-                                                                      inplace=False,
-                                                                      ignore_index=True)
-            self.index_first_self_test_in_ahead_records_chron = self.ahead_records_chron.commits.where(self.ahead_records_chron.commits == self.commit_id).first_valid_index()
-        return self.ahead_records_chron
+    def set_data(self, repo_test_records: pandas.DataFrame):
+        self.repo_test_records = repo_test_records
 
-    def set_data(self, behind_records: pandas.DataFrame, ahead_records: pandas.DataFrame):
-        """
-        :param behind_records:
-        :param ahead_records:
-        :return:
-        """
-
-        self.behind_records = behind_records
-
-        # Note that for behind_records, tests are ordered in order of reverse git merge.
-        self.index_last_self_test_in_behind_records = self.behind_records.commits.where(self.behind_records.commits == self.commit_id).last_valid_index()
-        self.index_after_last_self_test_in_behind_records = self.index_last_self_test_in_behind_records + 1
-
-        self.ahead_records = ahead_records
-
-        tests_against_this_commit = self.ahead_records[self.ahead_records['commits'] == self.commit_id]
+        tests_against_this_commit = self.repo_test_records[self.repo_test_records['commits'] == self.commit_id]
         self.discrete_outcomes = self.outcome_sums(tests_against_this_commit)
 
-        # When looking ahead, we don't need to consider any test records from before we arrived for look ahead,
-        # so keep track of the first instance of this commit in the ahead records.
-        # We've already found the records associated with this commit, so we can just use the index of
-        # the first row in the selected rows.
-        self.index_first_self_test_in_ahead_records = tests_against_this_commit.first_valid_index()
-
-        if OPERATING_MODE == Mode.ANALYZE_PAST:
-            # If we are in this mode, then ahead records are already populated in
-            # chronological order. No need for re-str in get_ahead_records_chron.
-            self.ahead_records_chron = self.ahead_records
-            self.index_first_self_test_in_ahead_records_chron = self.index_first_self_test_in_ahead_records
-
-        if self.created_at is None:
-            # If we don't know when the commit was created using github information, then
-            # approximate by the first release to test the commit.
-            if OPERATING_MODE == Mode.ANALYZE_PAST:
-                release_created = self.ahead_records.at[self.index_first_self_test_in_ahead_records, 'release_created']
-            else:
-                release_created = self.tests_against_this_commit.at[-1, 'release_created']
-            self.created_at = pandas.Timestamp(release_created, tz='UTC')
-            pass
+        self.index_first_self_test_in_records = tests_against_this_commit.first_valid_index()
+        self.index_last_self_test_in_records = tests_against_this_commit.last_valid_index()
 
     def record_observation_in_release(self, release_name: str):
         stream_name = PayloadStreams.get_stream(release_name)
@@ -268,67 +222,79 @@ class CommitOutcomes:
 
         return OutcomePair(self.commit_id, success_count=success_count, failure_count=failure_count, flake_count=flake_count)
 
-    def ahead(self, count: int, after_date: Optional[numpy.datetime64] = None) -> pandas.DataFrame:
+    def ahead(self, count: int, mode: Mode = Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS, after_date: Optional[numpy.datetime64] = None) -> pandas.DataFrame:
         outcomes: Optional[pandas.DataFrame] = None
 
         if after_date:
             # If date filtering is being used, the caller cares about specific time periods, so we
             # use ahead_records_chron. Unlike Mode.DETECT_CURRENT ahead calls, this means we will not
             # prefer new test results over old.
-            ahead_records_chron = self.get_ahead_records_chron()
-            outcomes = ahead_records_chron[(ahead_records_chron.index >= self.index_first_self_test_in_ahead_records_chron) & (ahead_records_chron['modified_time'] >= after_date)]
+            ahead_records_chron = self.repo_test_records
+            outcomes = ahead_records_chron[(ahead_records_chron.index >= self.index_first_self_test_in_records) & (ahead_records_chron['modified_time'] >= after_date)]
             if count > -1:
                 found_count = len(outcomes)
                 if found_count >= count:
-                    outcomes = outcomes.iloc[:count]
+                    outcomes = outcomes.iloc[:count]  # Return closest after date (ignore mode since it would always return newest results)
                 else:
-                    # Not enough results before date, ignore slide collection window back as far as we can from that date
+                    # Not enough results before date, so slide collection window back as far as we can from that date
                     first_index_of_desired_date = outcomes.first_valid_index()  # Where did we start finding data?
                     if first_index_of_desired_date is None:
                         # There are no records for this commit's (or its ancestors) future test results.
                         # Just return the oldest records we have.
-                        outcomes = ahead_records_chron[-1 * count:]
+                        outcomes = ahead_records_chron[self.index_first_self_test_in_records:][-1 * count:]
                     else:
                         remaining = count - found_count
                         backup_to = first_index_of_desired_date - remaining
-                        if backup_to < self.index_first_self_test_in_ahead_records_chron:
+                        if backup_to < self.index_first_self_test_in_records:
                             # If we backup to collect the required amount, we would return records before our commit was introduced.
                             # So limit how far we backup.
-                            backup_to = self.index_first_self_test_in_ahead_records_chron
-                        outcomes = self.ahead_records_chron.iloc[backup_to:backup_to+count]
+                            backup_to = self.index_first_self_test_in_records
+                        outcomes = ahead_records_chron.iloc[backup_to:backup_to+count]
 
         if outcomes is None:
-            outcomes = self.ahead_records.iloc[self.index_first_self_test_in_ahead_records:self.index_first_self_test_in_ahead_records+count]
+            if mode == Mode.PRIORITIZE_NEWEST_TEST_RESULTS:
+                # Get the most recent results for the commit possible
+                # Try to back up <count> from the last time we see this commit in the test records. If this takes us
+                # beyond the first time we see the commit, stop.
+                starting_index = max(self.index_last_self_test_in_records - count, self.index_first_self_test_in_records)
+            else:
+                # Otherwise, our starting index is the earliest modified_time test for the commit.
+                starting_index = self.index_first_self_test_in_records
+
+            outcomes = self.repo_test_records.iloc[starting_index:starting_index + count]
 
         return outcomes
 
-    def ahead_outcome(self, count: int, after_date: Optional[numpy.datetime64] = None) -> OutcomePair:
-        """
-        :param count: The desired number of test results to analyze. -1 for unlimited.
-        :param after_date: Constrain to results to after date. Unless count >-1 is specified in which case if there are
-                            too few results before the date.
-        :return:
-        """
-        return self.outcome_sums(self.ahead(count=count, after_date=after_date))
+    def ahead_outcome(self, count: int, mode: Mode = Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS, after_date: Optional[numpy.datetime64] = None) -> OutcomePair:
+        return self.outcome_sums(self.ahead(count=count, mode=mode, after_date=after_date))
 
-    def behind_outcome(self, count: Optional[int] = None, after_date: Optional[numpy.datetime64] = None) -> OutcomePair:
-        if count is None and after_date is None:
-            count = 10
-
-        if count:
-            filtered = self.behind_records.iloc[self.index_after_last_self_test_in_behind_records:self.index_after_last_self_test_in_behind_records+count]
-            return self.outcome_sums(filtered)
+    def ahead_outcome_best(self, count: int) -> OutcomePair:
+        original_outcome = self.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS))
+        newest_outcome = self.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_NEWEST_TEST_RESULTS))
+        if original_outcome.pass_rate() > newest_outcome.pass_rate():
+            return original_outcome
         else:
-            filtered = self.behind_records[(self.behind_records.index >= self.index_after_last_self_test_in_behind_records) & (self.behind_records['modified_time'] > after_date)]
-            return self.outcome_sums(filtered)
+            return newest_outcome
+
+    def behind(self, count: Optional[int] = None) -> pandas.DataFrame:
+        # Note: behind always gets the newest test results for commits behind it.
+
+        # Try to back up <count> from the last time we see this commit in the test records. If this takes us
+        # beyond the first time we see the commit, stop.
+        starting_index = max(self.index_first_self_test_in_records - count, 0)
+        outcomes = self.repo_test_records.iloc[starting_index:min(starting_index+count, self.index_first_self_test_in_records)]
+        return outcomes
+
+    def behind_outcome(self, count: Optional[int] = None) -> OutcomePair:
+        return self.outcome_sums(self.behind(count=count))
 
     @cached_property
     def fe10(self):
-        return self.ahead_outcome(count=10).fishers_exact(self.behind_outcome(count=10))
+        return self.ahead_outcome_best(count=10).fishers_exact(self.behind_outcome(count=10))
 
     @cached_property
     def mlog10p_10(self):
-        return self.ahead_outcome(count=10).mlog10Test1t(self.behind_outcome(count=10))
+        return self.ahead_outcome_best(count=10).mlog10Test1t(self.behind_outcome(count=10))
 
     @cached_property
     def fe10_incoming_slope(self):
@@ -338,19 +304,19 @@ class CommitOutcomes:
 
     @cached_property
     def fe20(self):
-        return self.ahead_outcome(count=20).fishers_exact(self.behind_outcome(count=20))
+        return self.ahead_outcome_best(count=20).fishers_exact(self.behind_outcome(count=20))
 
     @cached_property
     def mlog10p_20(self):
-        return self.ahead_outcome(count=20).mlog10Test1t(self.behind_outcome(count=20))
+        return self.ahead_outcome_best(count=20).mlog10Test1t(self.behind_outcome(count=20))
 
     @cached_property
     def fe30(self):
-        return self.ahead_outcome(count=30).fishers_exact(self.behind_outcome(count=30))
+        return self.ahead_outcome_best(count=30).fishers_exact(self.behind_outcome(count=30))
 
     @cached_property
     def mlog10p_30(self):
-        return self.ahead_outcome(count=30).mlog10Test1t(self.behind_outcome(count=30))
+        return self.ahead_outcome_best(count=30).mlog10Test1t(self.behind_outcome(count=30))
 
     @cached_property
     def worse_than_parent(self) -> bool:
@@ -507,12 +473,11 @@ SourceLocation = str
 CommitId = str
 
 
-OPERATING_MODE = Mode.ANALYZE_PAST
 INCLUDE_PR_TESTS = True
 LIMIT_ARCH = 'amd64'
-LIMIT_NETWORK = 'ovn'
-LIMIT_PLATFORM = 'azure'
-LIMIT_UPGRADE = 'upgrade-micro'
+LIMIT_NETWORK = '%'  # 'ovn'
+LIMIT_PLATFORM = 'gcp'
+LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 # LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
 # LIMIT_TEST_ID_SUFFIXES = list('56789')  # ids end with a hex digit, so cover everything.
 LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
@@ -521,7 +486,8 @@ LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 def analyze_test_id(name_group_commits):
     name_group, commits_ordinals = name_group_commits
     name, test_id_group = name_group
-    grouped_by_nurp = test_id_group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
+    # grouped_by_nurp = test_id_group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
+    grouped_by_nurp = test_id_group.groupby(['platform', 'test_id'], sort=False)
     for name, nurp_group in grouped_by_nurp:
         # print(f'Processing {name}')
 
@@ -548,7 +514,13 @@ def analyze_test_id(name_group_commits):
             for idx in range(len(commits)):
                 commit_id = commits[idx]
                 if commit_id not in all_commits:
-                    created_at = commits_ordinals.get(commit_id, (None,None))[1]
+                    created_at = commits_ordinals.get(commit_id, (None, None))[1]
+                    if created_at is None:
+                        # If we don't know when the commit was created using github information, then
+                        # approximate by the first release to test the commit.
+                        release_created = t.release_created
+                        created_at = pandas.Timestamp(release_created, tz='UTC')
+
                     new_commit = CommitOutcomes(source_locations[idx], commit_id, created_at=created_at)
                     all_commits[new_commit.commit_id] = new_commit
                 all_commits[commit_id].record_observation_in_release(t.release_name)
@@ -570,12 +542,10 @@ def analyze_test_id(name_group_commits):
                 pass
             return ordinal
 
-        ordered_commits.sort(key=ordinal_for_commit)
-
         linked: Set[str] = set()
         linked_commits: Dict[SourceLocation, CommitOutcomes] = dict()
-        for commit_id in ordered_commits:
-            commit_to_update = all_commits[commit_id]
+        for commit_to_update in sorted(list(all_commits.values()), key=lambda c: c.created_at):
+            commit_id = commit_to_update.commit_id
             source_location = commit_to_update.source_location
             if source_location not in linked_commits:
                 # Initial commit found for repo
@@ -647,39 +617,30 @@ def analyze_test_id(name_group_commits):
         # above about why commits are ascending order (order of commit history within
         # a given repo) and modified_time (test run time) is descending (reverse
         # chronological).
-        ahead_test_records_groups: Dict[str, pandas.DataFrame] = dict()
+        repo_test_record_groups: Dict[str, pandas.DataFrame] = dict()
         for group_name, group in flattened_groups_by_source_location:
-            # ignore_index means the sort will return a dataframe with index=0 for the first item. This is critical
-            # for set_data to be able to select appropriate ranges between indices.
-            group.sort_values(by=['commits', 'modified_time'], ascending=[True, OPERATING_MODE == Mode.ANALYZE_PAST], inplace=True, ignore_index=True)
-
             # Within a release payload, a commit may be encountered multiple times: one
             # for each component it is associated with (e.g. openshift/oc is associated with
             # cli, cli-artifacts, deployer, and tools). We don't want each these components
             # count an individual success/failure against the oc commit, or we will
             # 4x count it. Convert the commits into a set to dedupe.
+            # There's a small chance this could multiple successes / flakes / etc. We could fix this
+            # by deduping earlier, but in practice the loss should be minimal.
             group.drop_duplicates(inplace=True)
-            ahead_test_records_groups[group_name] = group
 
-        # We are about to process test results for children. See long comment
-        # above about why commits are descending order (reverse of commit history within
-        # a given repo) and modified_time (test run time) is descending (reverse
-        # chronological).
-        behind_test_records_groups: Dict[str, pandas.DataFrame] = dict()
-        for group_name, group in ahead_test_records_groups.items():
-            # Here, we cannot sort in place, since we've already established ahead groups.
             # ignore_index means the sort will return a dataframe with index=0 for the first item. This is critical
-            # for set_data to be able to select appropriate ranges between indices.
-            behind_test_records = group.sort_values(by=['commits', 'modified_time'], ascending=[False, OPERATING_MODE == Mode.ANALYZE_PAST], inplace=False, ignore_index=True)
-            behind_test_records_groups[group_name] = behind_test_records
+            # for set_data to be able to select appropriate ranges between indices. It's vital to drop duplucates
+            # before the sort, or else the index values will not be contiguous.
+            group.sort_values(by=['commits', 'modified_time'], ascending=[True, True], inplace=True, ignore_index=True)
+            repo_test_record_groups[group_name] = group
 
-        import cProfile, pstats, io
-        from pstats import SortKey
-        pr = cProfile.Profile()
-        pr.enable()
+        # import cProfile, pstats, io
+        # from pstats import SortKey
+        # pr = cProfile.Profile()
+        # pr.enable()
 
         for commit_outcome in all_commits.values():
-            commit_outcome.set_data(behind_test_records_groups[commit_outcome.source_location], ahead_test_records_groups[commit_outcome.source_location])
+            commit_outcome.set_data(repo_test_record_groups[commit_outcome.source_location])
 
         def le_grande_order(commit: CommitOutcomes):
             # Returning a tuple means order by first attribute, then next, then..
@@ -695,21 +656,16 @@ def analyze_test_id(name_group_commits):
             )
 
         relevant_count = 0
-        unresolved_regression: List[CommitOutcomes] = list()
+        unresolved_regression: List[str] = list()
+        resolved_regression: List[str] = list()
         by_le_grande_order: List[CommitOutcomes] = sorted(list(all_commits.values()), key=le_grande_order)
 
-        pr.disable()
-        s = io.StringIO()
-        sortby = SortKey.CUMULATIVE
-        ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-        ps.print_stats()
-        print(s.getvalue())
-
-        print(f'Found {relevant_count}')
-        print(f'Found {len(unresolved_regression)} unresolved regressions')
-        for c in unresolved_regression:
-            print(c)
-            print()
+        # pr.disable()
+        # s = io.StringIO()
+        # sortby = SortKey.CUMULATIVE
+        # ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
+        # ps.print_stats()
+        # print(s.getvalue())
 
         for c in by_le_grande_order:
             # if c.fe_dynamic > -0.98:
@@ -718,16 +674,22 @@ def analyze_test_id(name_group_commits):
             #     continue
             relevant_count += 1
             print(f'{le_grande_order(c)}')
-            # regressed, resolution = c.regression_info()
-            # if regressed and not resolution:
-            #     unresolved_regression.append(c)
+            regressed, resolution = c.regression_info()
+            if regressed and not resolution:
+                unresolved_regression.append(c.commit_id)
+            if regressed and resolution:
+                resolved_regression.append(c.commit_id)
             print(c)
             print()
 
+        print(f'Found {relevant_count}')
+        print(f'Found {len(unresolved_regression)} unresolved regressions: {unresolved_regression}')
+        print(f'Found {len(resolved_regression)} resolved regressions: {resolved_regression}')
 
+        commit_ids = []
         z = []
         release_names: OrderedDict[str, bool] = OrderedDict()  # y axis
-        source_locations = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
+        source_locations: List = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
         for t in nurp_group.itertuples():
             if PayloadStreams.get_stream(t.release_name) != PayloadStreams.NIGHTLY_PAYLOAD:
                 continue
@@ -747,37 +709,63 @@ def analyze_test_id(name_group_commits):
             commit_outcomes_by_source_location = {commit.source_location: commit for commit in commit_outcomes}
 
             #z_entry = [t.release_name]
+            commits_entry = []
             z_entry = []
             for source_location in source_locations:
                 c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
                 if c:
-
-                    z_entry.append(c.ahead_outcome(10, after_date=release_created).mlog10Test1t(c.behind_outcome(10)))
+                    ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
+                    behind_outcome = c.behind_outcome(10)
+                    mlog10P = ahead_outcome.mlog10Test1t(behind_outcome)
+                    commits_entry.append('ahead:' + str(ahead_outcome) + '<br>' + 'behind:' + str(behind_outcome) + '<br>' + 'fe10:' + str(c.fe10) + '<br>' + source_location + '<br>' + c.commit_id + '<br>' + t.release_name)
+                    z_entry.append(mlog10P)
                     # z_entry.append(f'g{c.commit_id[:5]}:t{c.ahead_outcome(10, after_date=release_created).mlog10Test1t(c.behind_outcome(10))}')
                 else:
+                    commits_entry.append('?')
                     z_entry.append(0.0)
                     #z_entry.append('?')
 
             z.append(z_entry)
+            commit_ids.append(commits_entry)
 
-        pandas.DataFrame(z).to_csv('what.csv', index_label=source_locations)
+        df_z = pandas.DataFrame(
+            data=z,
+            columns=source_locations)
+        df_commit_ids = pandas.DataFrame(commit_ids)
 
 
         try:
-            fig = go.Figure(data=[go.Surface(z=z)])
-            fig.update_layout(title='Mt Bruno Elevation',
-                              autosize=False,
-                              # xaxis=dict(
-                              #     tickmode='auto',
-                              #     nticks=len(source_locations),
-                              # ),
-                              # yaxis=dict(
-                              #     tickmode='auto',
-                              #     nticks=len(release_names),
-                              # ),
-                              width=1200, height=1200,
-                              margin=dict(l=65, r=50, b=65, t=90))
+            # fig = px.imshow(z)
+            fig = go.Figure(data=go.Heatmap(
+                z=df_z.values,
+                text=df_commit_ids,
+                # x=source_locations,
+                # y=list(release_names.keys())
+            ))
+            fig.update_layout(
+                yaxis=dict(
+                    visible=False,
+                ),
+                xaxis=dict(
+                    visible=False,
+                )
+            )
             fig.show()
+            pass
+            # fig = go.Figure(data=[go.Surface(z=z)])
+            # fig.update_layout(title='Mt Bruno Elevation',
+            #                   autosize=False,
+            #                   # xaxis=dict(
+            #                   #     tickmode='auto',
+            #                   #     nticks=len(source_locations),
+            #                   # ),
+            #                   # yaxis=dict(
+            #                   #     tickmode='auto',
+            #                   #     nticks=len(release_names),
+            #                   # ),
+            #                   width=1200, height=1200,
+            #                   margin=dict(l=65, r=50, b=65, t=90))
+            # fig.show()
         except Exception as e:
             traceback.print_exc()
 
@@ -786,7 +774,8 @@ if __name__ == '__main__':
     scan_period_days = 14  # days
     # before_datetime = datetime.datetime.utcnow()
     # TODO: REMOVE fixed date after testing
-    before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
+    # before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
+    before_datetime = datetime.datetime(2023, 7, 24, 4, 10, 0)  # This is a time shortly before the first test results including the revert to the Azure regression.
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
     before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S")
     after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S")
