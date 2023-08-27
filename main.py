@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
+import math
 import multiprocessing
 import datetime
 import traceback
 from typing import NamedTuple, List, Dict, Set, Tuple, Optional
 from enum import Enum
 import time
+import re
 
 import numpy
 import tqdm
 from collections import OrderedDict
 
+from airium import Airium
+
 import itertools
 import pandas
 from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
-from functools import cached_property
+from functools import cached_property, lru_cache
 
 import plotly.graph_objects as go
 import plotly.express as px
@@ -25,6 +29,9 @@ pandas.options.compute.use_numexpr = True
 class Mode(Enum):
     PRIORITIZE_NEWEST_TEST_RESULTS = 0  # Useful if we are triggering new tests to evaluate signal or want to see if a signal is falling
     PRIORITIZE_ORIGINAL_TEST_RESULTS = 1
+
+
+RELEASE_NAME_SPLIT_REGEX = re.compile(r"(.*-0\.[^-]+)-(.*)")
 
 
 class PayloadStreams(Enum):
@@ -44,6 +51,18 @@ class PayloadStreams(Enum):
             return PayloadStreams.PR_PAYLOAD
 
         return None
+
+    @staticmethod
+    def split(release_name: str) -> Optional[Tuple[str, str]]:
+        """
+        Splits a release name into a prefix and suffix.
+        :param release_name: e.g. "4.14.0-0.nightly-2023-07-10-065310"
+        :return: e.g. ("4.14.0-0.nightly", "2023-07-10-065310")
+        """
+        m = RELEASE_NAME_SPLIT_REGEX.match(release_name)
+        if not m:
+            return 'UnknownStream', 'Unknown'
+        return m.group(1), m.group(2)
 
 
 class WrappedInteger:
@@ -227,7 +246,7 @@ class CommitOutcomes:
 
         if after_date:
             # If date filtering is being used, the caller cares about specific time periods, so we
-            # use ahead_records_chron. Unlike Mode.DETECT_CURRENT ahead calls, this means we will not
+            # use ahead_records_chron. Unlike Mode.PRIORITIZE_NEWEST_TEST_RESULTS ahead calls, this means we will not
             # prefer new test results over old.
             ahead_records_chron = self.repo_test_records
             outcomes = ahead_records_chron[(ahead_records_chron.index >= self.index_first_self_test_in_records) & (ahead_records_chron['modified_time'] >= after_date)]
@@ -236,7 +255,7 @@ class CommitOutcomes:
                 if found_count >= count:
                     outcomes = outcomes.iloc[:count]  # Return closest after date (ignore mode since it would always return newest results)
                 else:
-                    # Not enough results before date, so slide collection window back as far as we can from that date
+                    # Not enough results after date, so slide collection window back as far as we can from that date
                     first_index_of_desired_date = outcomes.first_valid_index()  # Where did we start finding data?
                     if first_index_of_desired_date is None:
                         # There are no records for this commit's (or its ancestors) future test results.
@@ -268,6 +287,7 @@ class CommitOutcomes:
     def ahead_outcome(self, count: int, mode: Mode = Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS, after_date: Optional[numpy.datetime64] = None) -> OutcomePair:
         return self.outcome_sums(self.ahead(count=count, mode=mode, after_date=after_date))
 
+    @lru_cache(maxsize=10)
     def ahead_outcome_best(self, count: int) -> OutcomePair:
         original_outcome = self.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS))
         newest_outcome = self.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_NEWEST_TEST_RESULTS))
@@ -285,11 +305,12 @@ class CommitOutcomes:
         outcomes = self.repo_test_records.iloc[starting_index:min(starting_index+count, self.index_first_self_test_in_records)]
         return outcomes
 
+    @lru_cache(maxsize=10)
     def behind_outcome(self, count: Optional[int] = None) -> OutcomePair:
         return self.outcome_sums(self.behind(count=count))
 
     @cached_property
-    def fe10(self):
+    def fe10(self) -> float:
         return self.ahead_outcome_best(count=10).fishers_exact(self.behind_outcome(count=10))
 
     @cached_property
@@ -529,19 +550,6 @@ def analyze_test_id(name_group_commits):
         # order in which they merged. Build a definitive order using information from github.
         ordered_commits: List[str] = list(all_commits.keys())
 
-        # If the exact ordering of a commit is not known, preserve
-        # the ordering encountered in the incoming list.
-        pos_for_missing_info = -100000000000
-
-        def ordinal_for_commit(commit_id):
-            nonlocal pos_for_missing_info
-            ordinal = commits_ordinals.get(commit_id, (pos_for_missing_info,))
-            if ordinal[0] < 0:
-                pos_for_missing_info += 1
-            else:
-                pass
-            return ordinal
-
         linked: Set[str] = set()
         linked_commits: Dict[SourceLocation, CommitOutcomes] = dict()
         for commit_to_update in sorted(list(all_commits.values()), key=lambda c: c.created_at):
@@ -687,16 +695,25 @@ def analyze_test_id(name_group_commits):
         print(f'Found {len(resolved_regression)} resolved regressions: {resolved_regression}')
 
         commit_ids = []
-        z = []
+        z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
         release_names: OrderedDict[str, bool] = OrderedDict()  # y axis
         source_locations: List = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
-        for t in nurp_group.itertuples():
+
+        release_info = nurp_group.sort_values(by=['release_created'], ascending=[True])
+
+        unchanged_source_locations: Set[str] = set()
+
+        for t in release_info.itertuples():
             if PayloadStreams.get_stream(t.release_name) != PayloadStreams.NIGHTLY_PAYLOAD:
                 continue
 
-            release_names[t.release_name] = True
+            if t.release_name in z:
+                # We've already included an analysis of commits relative to this release's release_created date.
+                continue
+
             if not source_locations:
                 source_locations = sorted(list(t.source_locations))
+                unchanged_source_locations.update(source_locations)  # Assume every source location does not have more than one commit until proven later.
 
             release_created = t.release_created
 
@@ -708,31 +725,134 @@ def analyze_test_id(name_group_commits):
             # but this should be exceedingly rare.
             commit_outcomes_by_source_location = {commit.source_location: commit for commit in commit_outcomes}
 
-            #z_entry = [t.release_name]
+            z_entry: OrderedDict[str, Tuple] = OrderedDict()
             commits_entry = []
-            z_entry = []
             for source_location in source_locations:
                 c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
                 if c:
                     ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
+                    # ahead_outcome = c.ahead_outcome_best(10)
+                    # fe10 = c.fe10
                     behind_outcome = c.behind_outcome(10)
-                    mlog10P = ahead_outcome.mlog10Test1t(behind_outcome)
-                    commits_entry.append('ahead:' + str(ahead_outcome) + '<br>' + 'behind:' + str(behind_outcome) + '<br>' + 'fe10:' + str(c.fe10) + '<br>' + source_location + '<br>' + c.commit_id + '<br>' + t.release_name)
-                    z_entry.append(mlog10P)
-                    # z_entry.append(f'g{c.commit_id[:5]}:t{c.ahead_outcome(10, after_date=release_created).mlog10Test1t(c.behind_outcome(10))}')
-                else:
-                    commits_entry.append('?')
-                    z_entry.append(0.0)
-                    #z_entry.append('?')
 
-            z.append(z_entry)
+                    if behind_outcome.failure_count + behind_outcome.success_count > 0:
+                        if source_location in unchanged_source_locations:
+                            # There is at least one commit in this source location that has test runs
+                            # before it was introduced. Make sure to include it in the visualizations /
+                            # analysis.
+                            # This is useful to reduce the amount of information displayed by excluding
+                            # repos that did not change at all during the scan window.
+                            unchanged_source_locations.remove(source_location)
+                        fe10 = ahead_outcome.fishers_exact(behind_outcome)
+                    else:
+                        fe10 = math.nan  # If there is nothing behind to compare against, fe is meaningless.
+
+                    # msg = 'ahead:' + str(ahead_outcome) + '&#010;' + 'behind:' + str(behind_outcome) + '&#010;' + 'fe10:' + str(c.fe10) + '&#010;' + source_location + '&#010;' + c.commit_id + '&#010;' + t.release_name
+                    msg = 'ahead:' + str(ahead_outcome) + '&#010;' + 'behind:' + str(
+                        behind_outcome) + '&#010;' + 'fe10:' + str(
+                        fe10) + '&#010;' + source_location + '&#010;' + c.commit_id + '&#010;' + t.release_name
+                    z_entry[source_location] = (fe10, msg, c)
+                else:
+                    z_entry[source_location] = (0.0, '?', None)
+
+            z[t.release_name] = z_entry
             commit_ids.append(commits_entry)
 
-        df_z = pandas.DataFrame(
-            data=z,
-            columns=source_locations)
-        df_commit_ids = pandas.DataFrame(commit_ids)
+        def fe10_color(fe10):
+            if math.isnan(fe10):
+                # Indicate visually that there is no semantic value to the
+                # record since there is no commit prior to this commit in the
+                # test records and thus nothing to compare against.
+                return '#888'
+            r = 0xff
+            g = 0xff
+            b = 0xff
+            if fe10 < -0.1:
+                r = 100 + int(155 * (1 - abs(fe10)))
+                g = 0
+                b = 0
+            if fe10 > 0.1:
+                r = 0
+                g = 100 + int(155 * (1 - abs(fe10)))
+                b = 0
+            return f'#{r:0>2X}{g:0>2X}{b:0>2X}'
 
+        repos_by_first_letter: OrderedDict[str, OrderedDict[str, bool]] = OrderedDict()
+        for source_location in source_locations:
+            if source_location in unchanged_source_locations:
+                continue
+
+            repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
+            first_letter = repo_name[:1]
+            if first_letter not in repos_by_first_letter:
+                repos_by_first_letter[first_letter] = OrderedDict()
+            repos_by_first_letter[first_letter][repo_name] = True
+
+        a = Airium()
+        a('<!DOCTYPE html>')
+        with a.html():
+            with a.head():
+                a.meta(charset='utf-8')
+                a.title(_t=qtest_id)
+                with a.style():
+                    a('.rb { width: 8px; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
+                    a('.rb-new { width: 8px; height: 10px; border: 2px solid #00d; box-sizing: border-box; }')
+                    a('table.results { font-family: monospace; text-align: left; font-size: 8px; line-height: 10px; border-collapse: collapse; border-spacing: 0px; }')
+                    a('table.results td { padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 11px; }')
+                    a('table.results tr { padding: 0px; margin: 0px; white-space: nowrap;}')
+                    a('table.results th { padding: 0px; margin: 0px; white-space: nowrap;}')
+            with a.body():
+                with a.h3():
+                    a(f'Test: {test_name} ({test_id}')
+
+                with a.h4():
+                    a(f'Upgrade: {upgrade}')
+
+                with a.h4():
+                    a(f'Platform: {platform}')
+
+                with a.h4():
+                    a(f'Network: {network}')
+
+                with a.h4():
+                    a(f'Arch: {arch}')
+
+                if len(z) > 0:
+                    release_stream_prefix = PayloadStreams.split(list(z.keys())[0])[0]  # prefix of first release in results; this should be the same for all other releases in the results.
+                    with a.h5():
+                        a(f'Release Stream: {release_stream_prefix}')
+
+                with a.table(klass="results"):
+                    with a.tr():
+                        a.th(_t='release')
+                        for first_letter, sl_list in repos_by_first_letter.items():
+                            a.th(_t=first_letter, colspan=f'{len(sl_list)}')
+
+                    with a.tr():
+                        a.th(_t='')  # release column
+                        for _, sl_list in repos_by_first_letter.items():
+                            for repo_name in sl_list:
+                                a.th(_t=repo_name[1:2], title=repo_name)  # second letter
+
+                    commits_encountered: Set[str] = set()
+                    for release_name, z_entry in z.items():
+                        with a.tr():
+                            a.td(_t=PayloadStreams.split(release_name)[1])  # release name suffix
+                            for source_location, item_tuple in z_entry.items():
+                                item, msg, c = item_tuple
+                                if source_location in unchanged_source_locations:
+                                    continue
+                                new_commit = c.commit_id not in commits_encountered
+                                if new_commit:
+                                    commits_encountered.add(c.commit_id)
+                                with a.td(title=msg):
+                                    if new_commit:
+                                        a.div(klass='rb-new', style=f'background-color:{fe10_color(item)};')
+                                    else:
+                                        a.div(klass='rb', style=f'background-color:{fe10_color(item)};')
+
+        with open('airium.html', mode='w+') as f:
+            f.write(str(a))
 
         try:
             # fig = px.imshow(z)
@@ -774,8 +894,8 @@ if __name__ == '__main__':
     scan_period_days = 14  # days
     # before_datetime = datetime.datetime.utcnow()
     # TODO: REMOVE fixed date after testing
-    # before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
-    before_datetime = datetime.datetime(2023, 7, 24, 4, 10, 0)  # This is a time shortly before the first test results including the revert to the Azure regression.
+    before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
+    # before_datetime = datetime.datetime(2023, 7, 24, 4, 10, 0)  # This is a time shortly before the first test results including the revert to the Azure regression.
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
     before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S")
     after_str = after_datetime.strftime("%Y-%m-%d %H:%M:%S")
