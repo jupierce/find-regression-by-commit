@@ -8,6 +8,7 @@ from typing import NamedTuple, List, Dict, Set, Tuple, Optional
 from enum import Enum
 import time
 import re
+import pathlib
 
 import numpy
 import tqdm
@@ -545,8 +546,8 @@ LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 def analyze_test_id(name_group_commits):
     name_group, commits_ordinals = name_group_commits
     name, test_id_group = name_group
-    # grouped_by_nurp = test_id_group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
-    grouped_by_nurp = test_id_group.groupby(['platform', 'test_id'], sort=False)
+    grouped_by_nurp = test_id_group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
+    # grouped_by_nurp = test_id_group.groupby(['platform', 'test_id'], sort=False)
     for name, nurp_group in grouped_by_nurp:
         # print(f'Processing {name}')
 
@@ -655,8 +656,8 @@ def analyze_test_id(name_group_commits):
             )
 
         relevant_count = 0
-        unresolved_regression: List[str] = list()
-        resolved_regression: List[str] = list()
+        unresolved_regression: List[CommitOutcomes] = list()
+        resolved_regression: List[CommitOutcomes] = list()
         by_le_grande_order: List[CommitOutcomes] = sorted(list(all_commits.values()), key=le_grande_order)
 
         for c in by_le_grande_order:
@@ -664,19 +665,33 @@ def analyze_test_id(name_group_commits):
             print(f'{le_grande_order(c)}')
             regressed, resolution = c.regression_info
             if regressed and not resolution:
-                unresolved_regression.append(c.commit_id)
+                unresolved_regression.append(c)
             if regressed and resolution:
-                resolved_regression.append(c.commit_id)
+                resolved_regression.append(c)
             print(c)
             print()
 
         print(f'Found {relevant_count}')
-        print(f'Found {len(unresolved_regression)} unresolved regressions: {unresolved_regression}')
-        print(f'Found {len(resolved_regression)} resolved regressions: {resolved_regression}')
+        print(f'Found {len(unresolved_regression)}')
+        print(f'Found {len(resolved_regression)}')
+
+        analysis_path = pathlib.Path('analysis')
+        analysis_path.mkdir(parents=True, exist_ok=True)
+
+        if unresolved_regression:
+            output_base = analysis_path.joinpath('unresolved')
+        elif resolved_regression:
+            output_base = analysis_path.joinpath('resolved')
+        else:
+            # Don't bother generating a report
+            continue
+
+        output_base.mkdir(parents=True, exist_ok=True)
+        output_path = output_base.joinpath(f'{qtest_id}.html')
 
         commit_ids = []
         z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
-        source_locations: OrderedDict[str, bool] = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
+        source_locations: OrderedDict[str, bool] = OrderedDict()  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
 
         release_info = nurp_group.sort_values(by=['release_created'], ascending=[True])
 
@@ -692,7 +707,7 @@ def analyze_test_id(name_group_commits):
 
             if not source_locations:
                 sorted_source_locations = sorted(list(t.source_locations))
-                source_locations = OrderedDict({sl: True for sl in sorted_source_locations})
+                source_locations.update({sl: True for sl in sorted_source_locations})
                 unchanged_source_locations.update(sorted_source_locations)  # Assume every source location does not have more than one commit until proven later.
 
             commit_outcomes: List[CommitOutcomes] = list()
@@ -778,6 +793,19 @@ def analyze_test_id(name_group_commits):
                     a('table.results tr { padding: 0px; margin: 0px; white-space: nowrap;}')
                     a('table.results th { position: relative; padding: 0px; margin: 0px; white-space: nowrap;}')
                     a('table.results tr:hover { color:blue; background-color: #ffa; }')
+
+                    a('''
+a.success:link, a.success:visited {
+    color: green;
+}                    
+a.failure:link, a.success:visited {
+    color: red;
+}                    
+a.flake:link, a.flake:visited {
+    color: gray;
+}                    
+''')
+
                     a('''
 table.results td:hover::after,
 th:hover::after {
@@ -888,6 +916,28 @@ th:hover::after {
                                 commit_encountered_count += 1
                                 commit_encountered_counts[c.commit_id] = commit_encountered_count
 
+                a.h2(_t='Unresolved Regressions')
+                if unresolved_regression:
+                    for c in unresolved_regression:
+                        with a.ul():
+                            with a.li():
+                                a.a(href=f'#{c.commit_id}', _t=f'{c.repo_name} {c.commit_id}')
+                else:
+                    a.span(_t='None')
+
+                a.br()
+
+                a.h2(_t='Resolved Regressions')
+                if resolved_regression:
+                    for c in resolved_regression:
+                        with a.ul():
+                            with a.li():
+                                a.a(href=f'#{c.commit_id}', _t=f'{c.repo_name} {c.commit_id}')
+                else:
+                    a.span(_t='None')
+
+                a.br()
+
                 a.h2(_t='Commit Details (Highest Possibility of Regression to Lowest)')
                 for c in by_le_grande_order:
                     with a.div():
@@ -919,7 +969,7 @@ th:hover::after {
                                     a.td(_t='Regression Resolution')
                                     with a.td():
                                         if resolution_outcomes:
-                                            a.a(href=f'#{resolution_outcomes.commit_id}', _t=f'{resolution_outcomes.repo_name} {resolution_outcomes.commit_id}')
+                                            a.a(href=f'#{resolution_outcomes.commit_id}', _t=f'{resolution_outcomes.commit_id}')
 
                             with a.tr():
                                 a.td(_t='Parent')
@@ -949,11 +999,11 @@ th:hover::after {
 
                             def render_test_run(row):
                                 for _ in range(row['flake_count']):
-                                    a.a(href=prowjob_url(row), _t='f', target="_blank")
+                                    a.a(href=prowjob_url(row), klass='testr flake', _t='f', target="_blank")
                                 if row['success_val'] > 0:
-                                    a.a(href=prowjob_url(row), _t='S', target="_blank")
+                                    a.a(href=prowjob_url(row), klass='testr success', _t='S', target="_blank")
                                 elif row['flake_count'] == 0:
-                                    a.a(href=prowjob_url(row), _t='F', target="_blank")
+                                    a.a(href=prowjob_url(row), klass='testr failure', _t='F', target="_blank")
 
                             if c.fe10 >= 0.90 or c.fe10 <= -0.90:
                                 with a.tr():
@@ -1019,7 +1069,7 @@ th:hover::after {
                                     a.td(_t=str(c.behind_outcome(10)))
                                     a.td(_t=str(c.ahead_outcome_best(10)))
 
-        with open('airium.html', mode='w+') as f:
+        with output_path.open(mode='w+') as f:
             f.write(str(a))
 
 
