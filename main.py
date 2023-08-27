@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import math
 import multiprocessing
 import datetime
-import traceback
 from typing import NamedTuple, List, Dict, Set, Tuple, Optional
 from enum import Enum
 import time
@@ -20,11 +21,11 @@ from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
 from functools import cached_property, lru_cache
 
-import plotly.graph_objects as go
-import plotly.express as px
-
 pandas.options.compute.use_numexpr = True
 
+
+def prowjob_url(row):
+    return row['prowjob_url']
 
 class Mode(Enum):
     PRIORITIZE_NEWEST_TEST_RESULTS = 0  # Useful if we are triggering new tests to evaluate signal or want to see if a signal is falling
@@ -34,21 +35,21 @@ class Mode(Enum):
 RELEASE_NAME_SPLIT_REGEX = re.compile(r"(.*-0\.[^-]+)-(.*)")
 
 
-class PayloadStreams(Enum):
+class ReleasePayloadStreams(Enum):
     CI_PAYLOAD = 'ci'
     NIGHTLY_PAYLOAD = 'nightly'
     PR_PAYLOAD = 'pr'
 
     @staticmethod
-    def get_stream(release_name: str):
+    def get_stream(release_name: str) -> Optional[ReleasePayloadStreams]:
         if '-0.ci-' in release_name:
-            return PayloadStreams.CI_PAYLOAD
+            return ReleasePayloadStreams.CI_PAYLOAD
 
         if '-0.nightly-' in release_name:
-            return PayloadStreams.NIGHTLY_PAYLOAD
+            return ReleasePayloadStreams.NIGHTLY_PAYLOAD
 
         if '-0.ci.test-' in release_name:
-            return PayloadStreams.PR_PAYLOAD
+            return ReleasePayloadStreams.PR_PAYLOAD
 
         return None
 
@@ -114,11 +115,10 @@ class ProwJobRun:
 
 class OutcomePair:
 
-    def __init__(self, commit_id, success_count: int, failure_count: int, flake_count: int):
+    def __init__(self, success_count: int, failure_count: int, flake_count: int):
         self.success_count = success_count
         self.failure_count = failure_count
         self.flake_count = flake_count
-        self.commit_id = commit_id
 
     def pass_rate(self) -> float:
         if self.success_count > 0 or self.failure_count > 0:
@@ -155,6 +155,25 @@ class OutcomePair:
             )
         return 0.0
 
+    @classmethod
+    def outcome_sums(cls, selection: pandas.DataFrame) -> OutcomePair:
+        test_runs = len(selection)
+        if test_runs > 0:
+            success_count = selection['success_val'].values.sum()
+            flake_count = selection['flake_count'].values.sum()
+        else:
+            # No tests have been run against this commit
+            success_count = 0
+            flake_count = 0
+
+        failure_count = test_runs - success_count - flake_count
+        if failure_count < 0:
+            # Rare case where the window of our select catches a flake but not the error record
+            # it is trying to account for.
+            failure_count = 0
+
+        return OutcomePair(success_count=success_count, failure_count=failure_count, flake_count=flake_count)
+
     def __str__(self):
         return f'[s={self.success_count} f={self.failure_count} r={int(self.pass_rate() * 100)}%]'
 
@@ -162,10 +181,35 @@ class OutcomePair:
 MAX_WINDOW_SIZE = 30
 
 
+class ReleasePayload:
+
+    def __init__(self, release_name: ReleaseName, release_created: pandas.Timestamp):
+        self.release_name = release_name
+        self.release_created = release_created
+        self.commits: Dict[str, 'CommitOutcomes'] = dict()
+        self.diff_commits: Set[CommitId] = set()
+        self.stream_name = ReleasePayloadStreams.get_stream(self.release_name)
+        self.stream_prefix, self.stream_suffix = ReleasePayloadStreams.split(self.release_name)
+
+    def add_commit(self, commit_outcome: 'CommitOutcomes', first_release_in_stream_with_commit):
+        """
+        :param commit_outcome: Information about the commit in this payload.
+        :param first_release_in_stream_with_commit: Whether this payload is the first to have included the commit within
+                                                    its respective payload stream (CI xor nightly).
+        """
+        if commit_outcome.commit_id:
+            self.commits[commit_outcome.commit_id] = commit_outcome
+            if first_release_in_stream_with_commit:
+                self.diff_commits.add(commit_outcome.commit_id)
+
+
 class CommitOutcomes:
 
     def __init__(self, source_location: str, commit_id: str, created_at: Optional[pandas.Timestamp]):
         self.source_location = source_location
+
+        self.repo_name = source_location.split('/')[-1] or '__'
+
         self.commit_id = commit_id
         self.created_at = created_at
         self.parent = None
@@ -178,25 +222,39 @@ class CommitOutcomes:
         self.discrete_outcomes: Optional[OutcomePair] = None
         self.tests_against_this_commit: Optional[pandas.DataFrame] = None
 
-        self.release_streams: Dict[PayloadStreams, OrderedDict[str, bool]] = {
-            PayloadStreams.NIGHTLY_PAYLOAD: OrderedDict(),  # We really just want an Ordered Set. Value doesn't matter.
-            PayloadStreams.CI_PAYLOAD: OrderedDict(),
-            PayloadStreams.PR_PAYLOAD: OrderedDict()
+        self.release_streams: Dict[ReleasePayloadStreams, OrderedDict[ReleaseName, ReleasePayload]] = {
+            ReleasePayloadStreams.NIGHTLY_PAYLOAD: OrderedDict(),  # We really just want an Ordered Set. Value doesn't matter.
+            ReleasePayloadStreams.CI_PAYLOAD: OrderedDict(),
+            ReleasePayloadStreams.PR_PAYLOAD: OrderedDict()
         }
 
     def set_data(self, repo_test_records: pandas.DataFrame):
+        """
+        :param repo_test_records: Test records ordered by commit and then test date. Dataframe index must be
+                                    monotonically increasing / continuous in order for selection logic to work.
+                                    Other methods of selection are possible, but using indices is extremely performant.
+        :return: None
+        """
         self.repo_test_records = repo_test_records
 
         self.tests_against_this_commit = self.repo_test_records[self.repo_test_records['commits'] == self.commit_id]
-        self.discrete_outcomes = self.outcome_sums(self.tests_against_this_commit)
+        self.discrete_outcomes = OutcomePair.outcome_sums(self.tests_against_this_commit)
 
         self.index_first_self_test_in_records = self.tests_against_this_commit.first_valid_index()
         self.index_last_self_test_in_records = self.tests_against_this_commit.last_valid_index()
 
-    def record_observation_in_release(self, release_name: str):
-        stream_name = PayloadStreams.get_stream(release_name)
-        if stream_name:
-            self.release_streams[stream_name][release_name] = True
+    def record_observation_in_release(self, release_payload: ReleasePayload):
+        """
+        Records in this object that this commit was tested as part of a ReleasePayload
+        and also informs the ReleasePayload object that this commit was tested as part of the payload.
+        :param release_payload: The payload the test was run against.
+        """
+        first_release_in_stream_with_this_commit = False
+        if release_payload.stream_name:
+            self.release_streams[release_payload.stream_name][release_payload.release_name] = release_payload
+            first_release_in_stream_with_this_commit = len(self.release_streams[release_payload.stream_name]) == 1
+
+        release_payload.add_commit(self, first_release_in_stream_with_this_commit)
 
     def get_ancestor_ids(self) -> List[str]:
         ancestors_commit_ids = []
@@ -223,24 +281,6 @@ class CommitOutcomes:
         if self.child:
             return self.child.commit_id
         return None
-
-    def outcome_sums(self, selection: pandas.DataFrame) -> OutcomePair:
-        test_runs = len(selection)
-        if test_runs > 0:
-            success_count = selection['success_val'].values.sum()
-            flake_count = selection['flake_count'].values.sum()
-        else:
-            # No tests have been run against this commit
-            success_count = 0
-            flake_count = 0
-
-        failure_count = test_runs - success_count - flake_count
-        if failure_count < 0:
-            # Rare case where the window of our select catches a flake but not the error record
-            # it is trying to account for.
-            failure_count = 0
-
-        return OutcomePair(self.commit_id, success_count=success_count, failure_count=failure_count, flake_count=flake_count)
 
     def ahead(self, count: int, mode: Mode = Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS, after_date: Optional[numpy.datetime64] = None) -> pandas.DataFrame:
         outcomes: Optional[pandas.DataFrame] = None
@@ -289,12 +329,68 @@ class CommitOutcomes:
         return outcomes
 
     def ahead_outcome(self, count: int, mode: Mode = Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS, after_date: Optional[numpy.datetime64] = None) -> OutcomePair:
-        return self.outcome_sums(self.ahead(count=count, mode=mode, after_date=after_date))
+        return OutcomePair.outcome_sums(self.ahead(count=count, mode=mode, after_date=after_date))
+
+    # Consider a list of test results ordered first by commit history
+    # (in our test results, commit order is only guaranteed for a given
+    # repo, so in the following example, A -> B -> C are all from the
+    # same repo) and then by time at which the test run was observed:
+    #    commitA
+    #       test result tA+0
+    #       test result tA+1
+    #       ...
+    #       test result tA+M
+    #    commitB
+    #       test result tB+0
+    #       test result tB+1
+    #       ...
+    #       test result tB+N
+    #    commitC
+    #       test result tC+0
+    #       test result tC+1
+    #       ...
+    #       test result tC+O
+    #
+    # Note that since tests can occur for a given commit at any time in our scan window,
+    # there is no guarantee that, for example, all tA times are greater than tB times.
+    #
+    # Assuming that we iterate forward through these results to analyze fe10 test successes
+    # and failures that happened before and after a commit. This approach has drawbacks.
+    #
+    # 1. When informing self about successes/failures ahead, we want to recognize the
+    #    results of tB+N for commitB because it represents the most recent test
+    #    results. This is important because if we devise a system that triggers
+    #    test runs to help ferret out real regressions vs likely regression commits
+    #    then these will happen later in chronological time. We want to give
+    #    then priority so that they impact our FE values instead of being ignored
+    #    because we already had fe30 accumulators filled up from tB+0, ....
+    # 2. When informing ancestors about successes/failures ahead, we also want
+    #    to include the latest test runs first -- for the same reason.
+    # 3. When informing children of success, the above ordering would lead commitA's
+    #    test runs to be contributed to commitC's behind accumulator before commitB's.
+    #    Obviously, the results of the parent commitB are more pertinent to commitC,
+    #    so we need to inform children by processing commits in reverse order of
+    #    commit history. As with (1) and (2), newer results should be preferred.
+    #
+    # So should we instead always prefer the newest test records? This also has drawbacks.
+    # If the newest records are preferred and the last test records associated with a commit
+    # happen to be in payloads including a regression unrelated to the commit, then
+    # the commit will be flagged as a regression despite the possibility that it ran
+    # the same test successfully for a long period prior to the introduction of the regression.
+    #
+    # To balance these drawbacks, ahead_outcome_best(...) will select the best fe10 between
+    # the newest and oldest tests runs associated with a commit.
+    # 1. If test runs are being triggered after a regression signal to isolate whether
+    #    regression is real, if a commit did not introduce the regression, then the _best
+    #    outcome will eventually gravitate to the new, successful runs.
+    # 2. If a commit has numerous successful runs before being included in a payload with
+    #    a commit causing a regression, then the earlier test records will be preferred
+    #    by _best.
 
     @lru_cache(maxsize=10)
     def ahead_outcome_best(self, count: int) -> OutcomePair:
-        original_outcome = self.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS))
-        newest_outcome = self.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_NEWEST_TEST_RESULTS))
+        original_outcome = OutcomePair.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS))
+        newest_outcome = OutcomePair.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_NEWEST_TEST_RESULTS))
         if original_outcome.pass_rate() > newest_outcome.pass_rate():
             return original_outcome
         else:
@@ -311,11 +407,15 @@ class CommitOutcomes:
 
     @lru_cache(maxsize=10)
     def behind_outcome(self, count: Optional[int] = None) -> OutcomePair:
-        return self.outcome_sums(self.behind(count=count))
+        return OutcomePair.outcome_sums(self.behind(count=count))
+
+    @lru_cache(maxsize=10)
+    def fe(self, window_size: int) -> float:
+        return self.ahead_outcome_best(count=window_size).fishers_exact(self.behind_outcome(count=window_size))
 
     @cached_property
     def fe10(self) -> float:
-        return self.ahead_outcome_best(count=10).fishers_exact(self.behind_outcome(count=10))
+        return self.fe(10)
 
     @cached_property
     def mlog10p_10(self):
@@ -329,7 +429,7 @@ class CommitOutcomes:
 
     @cached_property
     def fe20(self):
-        return self.ahead_outcome_best(count=20).fishers_exact(self.behind_outcome(count=20))
+        return self.fe(20)
 
     @cached_property
     def mlog10p_20(self):
@@ -337,7 +437,7 @@ class CommitOutcomes:
 
     @cached_property
     def fe30(self):
-        return self.ahead_outcome_best(count=30).fishers_exact(self.behind_outcome(count=30))
+        return self.fe(30)
 
     @cached_property
     def mlog10p_30(self):
@@ -354,35 +454,6 @@ class CommitOutcomes:
         if not self.parent:
             return True
         return not self.worse_than_parent
-
-    def _behind_scan(self) -> Tuple[int, int]:
-        successes = self.discrete_outcomes.success_count
-        failures = self.discrete_outcomes.failure_count
-
-        if self.worse_than_parent:
-            node = self
-            while node.parent and node.worse_than_parent:  # traverse as a valley
-                successes += node.parent.discrete_outcomes.success_count
-                failures += node.parent.discrete_outcomes.failure_count
-                node = node.parent
-
-        else:
-            node = self
-            while node.parent and node.better_than_parent:
-                successes += node.parent.discrete_outcomes.success_count
-                failures += node.parent.discrete_outcomes.failure_count
-                node = node.parent
-
-        return successes, failures
-
-    @cached_property
-    def behind_dynamic(self) -> OutcomePair:
-        successes, failures = self._behind_scan()
-        behind = OutcomePair(-1, self.commit_id)
-        # Looking behind us, we should not include our own successes/failures
-        behind.add_success(amount=successes - self.discrete_outcomes.success_count)
-        behind.add_failure(amount=failures - self.discrete_outcomes.failure_count)
-        return behind
 
     @cached_property
     def worse_than_child(self) -> bool:
@@ -404,34 +475,6 @@ class CommitOutcomes:
         # Otherwise, return True only if the child fe is worse than ours.
         return not self.worse_than_child
 
-    def _ahead_scan(self) -> Tuple[int, int]:
-        successes = self.discrete_outcomes.success_count
-        failures = self.discrete_outcomes.failure_count
-
-        if self.worse_than_child:
-            node = self
-            while node.child and node.worse_than_child and node.child.fe10 <= 0:  # traverse as a valley. Stop if child is improving.
-                successes += node.child.discrete_outcomes.success_count
-                failures += node.child.discrete_outcomes.failure_count
-                node = node.child
-
-        else:
-            node = self
-            while node.child and node.better_than_child and node.child.fe10 >= 0:  # traverse as peak. Stop if child is regressing.
-                successes += node.child.discrete_outcomes.success_count
-                failures += node.child.discrete_outcomes.failure_count
-                node = node.child
-
-        return successes, failures
-
-    @cached_property
-    def ahead_dynamic(self) -> OutcomePair:
-        successes, failures = self._ahead_scan()
-        ahead = OutcomePair(-1, commit_id=self.commit_id)
-        ahead.add_success(amount=successes)
-        ahead.add_failure(amount=failures)
-        return ahead
-
     def is_valley(self):
         return self.worse_than_parent and self.worse_than_child
 
@@ -441,33 +484,28 @@ class CommitOutcomes:
     def github_link(self):
         return f'{self.source_location}/commit/{self.commit_id}'
 
-    def regression_info(self):
+    @cached_property
+    def regression_info(self) -> Tuple[bool, Optional[CommitOutcomes]]:
         """
         :return: Returns True for the first element of the Tuple if this was a regression.
                     The second element of the Tuple is a commit outcomes the system believes resolved
                     the regression. None if the regression is still active.
         """
         if self.fe10 < -0.95 and self.is_valley():
-            # Qualifies as regression.
+            # Qualifies as possible regression.
             node = self.child
             while node:
                 if node.fe10 >= 0:  # If there is a commit causing the pass rate to increase or to have stabilized, see if it resolves us.
-                    resolution_fe = node.ahead_outcome(count=30).fishers_exact(self.behind_outcome(count=30))
+                    resolution_fe = node.ahead_outcome_best(count=30).fishers_exact(self.behind_outcome(count=30))
                     if resolution_fe >= -0.5:  # If the signal has improved or is close to statistically insignificant.
-                        # We've found a peak in front of our valley. Ahead of it
+                        # We've found an improvement ahead of our valley. Ahead of it
                         # and behind us look very similar statistically. Assume
                         # it resolves us.
-                        return True, node.github_link()
+                        return True, node
                 node = node.child
             return True, None
         else:
             return False, None
-
-    @cached_property
-    def fe_dynamic(self):
-        behind = self.behind_dynamic
-        ahead = self.ahead_dynamic
-        return ahead.fishers_exact(behind)
 
     def __str__(self):
         v = f'''Commit: {self.github_link()}
@@ -475,17 +513,12 @@ Created: {self.created_at}
 Peak: {self.is_peak()}
 Valley: {self.is_valley()}
 Discrete: {self.discrete_outcomes}
-Regression Info: {self.regression_info()}
 10:
   fe10: {self.mlog10p_10}
 20:
   fe20: {self.mlog10p_20}
 30:
   fe30: {self.mlog10p_30}
-dynamic:
-  behind: {{self.behind_dynamic}}
-  ahead: {{self.ahead_dynamic}}
-  fe: {{self.fe_dynamic}}
 '''
         if self.parent:
             v += f'Parent: {self.parent.commit_id}\n'
@@ -496,6 +529,7 @@ dynamic:
 
 SourceLocation = str
 CommitId = str
+ReleaseName = str
 
 
 INCLUDE_PR_TESTS = True
@@ -520,6 +554,8 @@ def analyze_test_id(name_group_commits):
         # we see them. If we don't have definitive ordering information from github, we will
         # use the order in which commits are observed as a heuristic for parent/child links.
         all_commits: OrderedDict[CommitId, CommitOutcomes] = OrderedDict()
+
+        all_releases: OrderedDict[ReleaseName, ReleasePayload] = OrderedDict()
 
         first_row = nurp_group.iloc[0]
         test_name = first_row['test_name']
@@ -548,7 +584,11 @@ def analyze_test_id(name_group_commits):
 
                     new_commit = CommitOutcomes(source_locations[idx], commit_id, created_at=created_at)
                     all_commits[new_commit.commit_id] = new_commit
-                all_commits[commit_id].record_observation_in_release(t.release_name)
+
+                if t.release_name not in all_releases:
+                    all_releases[t.release_name] = ReleasePayload(t.release_name, t.release_created)
+
+                all_commits[commit_id].record_observation_in_release(all_releases[t.release_name])
 
         # There is no guarantee that the order we observe commits being tested is the
         # order in which they merged. Build a definitive order using information from github.
@@ -578,63 +618,19 @@ def analyze_test_id(name_group_commits):
         # Restore source_locations into newly flattend dataframe. Each commit now has exactly one source location in its row.
         flattened_nurp_group['source_locations'] = flattened_nurp_group.apply(lambda x: all_commits[x.commits].source_location, axis=1)
 
-        # Consider a list of test results ordered first by commit history
-        # (in our test results, commit order is only guaranteed for a given
-        # repo, so in the following example, A -> B -> C are all from the
-        # same repo) and then by time at which the test run was observed:
-        #    commitA
-        #       test result tA+0
-        #       test result tA+1
-        #       ...
-        #       test result tA+M
-        #    commitB
-        #       test result tB+0
-        #       test result tB+1
-        #       ...
-        #       test result tB+N
-        #    commitC
-        #       test result tC+0
-        #       test result tC+1
-        #       ...
-        #       test result tC+O
-        #
-        # Note that since tests can occur for a given commit at any time in our scan window,
-        # there is no guarantee that, for example, all tA times are greater than tB times.
-        #
-        # Assuming that we iterate forward through these results to populate the commit
-        # aggregators (i.e. ahead and behind successes/failures), this ordering is not
-        # ideal.
-        #
-        # 1. When informing self about successes/failures ahead, we want to prioritize the
-        #    results of tB+N for commitB because it represents the most recent test
-        #    results. This is important because if we devise a system that triggers
-        #    test runs to help ferret out real regressions vs likely regression commits
-        #    then these will happen later in chronological time. We want to give
-        #    then priority so that they impact our FE values instead of being ignored
-        #    because we already had fe30 accumulators filled up from tB+0, ....
-        # 2. When informing ancestors about successes/failures ahead, we also want
-        #    to include the latest test runs first -- for the same reason.
-        # 3. When informing children of success, the above ordering would lead commitA's
-        #    test runs to be contributed to commitC's behind accumulator before commitB's.
-        #    Obviously, the results of the parent commitB are more pertinent to commitC,
-        #    so we need to inform children by processing commits in reverse order of
-        #    commit history. As with (1) and (2), newer results should be preferred.
-
         # We analyze test results on a repo by repo basis. For efficiency, we groupby
         # source_location. This means sorting, searching, etc, in subsequent methods
         # will only have to deal with relatively small groups of data.
         flattened_groups_by_source_location = flattened_nurp_group.groupby(by='source_locations', sort=False)
 
-        # We are about to process test results for self+ancestors. See long comment
-        # above about why commits are ascending order (order of commit history within
-        # a given repo) and modified_time (test run time) is descending (reverse
-        # chronological).
+        # We now have test results in groups. Each group is all test results for commits in a given
+        # upstream repo.
         repo_test_record_groups: Dict[str, pandas.DataFrame] = dict()
         for group_name, group in flattened_groups_by_source_location:
             # Within a release payload, a commit may be encountered multiple times: one
             # for each component it is associated with (e.g. openshift/oc is associated with
-            # cli, cli-artifacts, deployer, and tools). We don't want each these components
-            # count an individual success/failure against the oc commit, or we will
+            # cli, cli-artifacts, deployer, and tools). We don't want each of these components
+            # to count as an individual success/failure against the oc commit, or we will
             # 4x count it. Convert the commits into a set to dedupe.
             # There's a small chance this could multiple successes / flakes / etc. We could fix this
             # by deduping earlier, but in practice the loss should be minimal.
@@ -646,21 +642,12 @@ def analyze_test_id(name_group_commits):
             group.sort_values(by=['commits', 'modified_time'], ascending=[True, True], inplace=True, ignore_index=True)
             repo_test_record_groups[group_name] = group
 
-        # import cProfile, pstats, io
-        # from pstats import SortKey
-        # pr = cProfile.Profile()
-        # pr.enable()
-
         for commit_outcome in all_commits.values():
             commit_outcome.set_data(repo_test_record_groups[commit_outcome.source_location])
 
         def le_grande_order(commit: CommitOutcomes):
             # Returning a tuple means order by first attribute, then next, then..
             return (
-                #commit.fe_dynamic,
-                #commit.fe10_incoming_slope,
-                #commit.discrete_outcomes.pass_rate(),
-                #-1 * commit.ahead_dynamic.failure_count,
                 commit.mlog10p_10,
                 commit.mlog10p_20,
                 commit.mlog10p_30,
@@ -672,21 +659,10 @@ def analyze_test_id(name_group_commits):
         resolved_regression: List[str] = list()
         by_le_grande_order: List[CommitOutcomes] = sorted(list(all_commits.values()), key=le_grande_order)
 
-        # pr.disable()
-        # s = io.StringIO()
-        # sortby = SortKey.CUMULATIVE
-        # ps = pstats.Stats(pr, stream=s).sort_stats(sortby)
-        # ps.print_stats()
-        # print(s.getvalue())
-
         for c in by_le_grande_order:
-            # if c.fe_dynamic > -0.98:
-            #     break
-            # if not c.is_valley():
-            #     continue
             relevant_count += 1
             print(f'{le_grande_order(c)}')
-            regressed, resolution = c.regression_info()
+            regressed, resolution = c.regression_info
             if regressed and not resolution:
                 unresolved_regression.append(c.commit_id)
             if regressed and resolution:
@@ -707,7 +683,7 @@ def analyze_test_id(name_group_commits):
         unchanged_source_locations: Set[str] = set()
 
         for t in release_info.itertuples():
-            if PayloadStreams.get_stream(t.release_name) != PayloadStreams.NIGHTLY_PAYLOAD:
+            if ReleasePayloadStreams.get_stream(t.release_name) != ReleasePayloadStreams.NIGHTLY_PAYLOAD:
                 continue
 
             if t.release_name in z:
@@ -769,13 +745,16 @@ def analyze_test_id(name_group_commits):
             r = 0xff
             g = 0xff
             b = 0xff
-            if fe10 < -0.90:
-                r = 100 + int(155 * (1 - abs(fe10)))
+            alpha = 0.10  # Only display p-values less than this (i.e. more improbable than this)
+            if fe10 < -1 + alpha:
+                brightness = (1 - abs(fe10)) / alpha   # the closer fe10 is to -1, the darker we want the red
+                r = 100 + int(155 * brightness)
                 g = 0
                 b = 0
-            if fe10 > 0.90:
+            if fe10 > 1 - alpha:
+                brightness = (1 - abs(fe10)) / alpha  # the closer fe10 is to -1, the darker we want the green
                 r = 0
-                g = 100 + int(155 * (1 - abs(fe10)))
+                g = 100 + int(155 * brightness)
                 b = 0
             return f'#{r:0>2X}{g:0>2X}{b:0>2X}'
 
@@ -787,20 +766,74 @@ def analyze_test_id(name_group_commits):
                 a.title(_t=qtest_id)
                 with a.style():
                     a('.rb { width: 15px; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
-                    a('.rb-unknown { width: 15px; height: 10px; border: 0px solid #888; background-color: #eee; box-sizing: border-box;}')
-                    a('.rb-new { width: 15px; height: 10px; border: 1px solid #00d; box-sizing: border-box; }')
+                    a('.rb-unknown { width: 15px; height: 10px; border: 0px solid #888; background-color: #eee; box-sizing: border-box;}')  # Used for commits which do not have a commit before them; thus no information to make regression determination.
+                    a('.rb-new { width: 15px; height: 10px; border: 2px solid #000; box-sizing: border-box; }')  # Highlights newly introduced commits
 
                     a('th.release-name { height: 140px; white-space: nowrap; }')
                     a('th.release-name > div { transform: translate(0px, 51px) rotate(315deg); width: 15px; }')
                     a('th.release-name > div > span { border-bottom: 1px solid #ccc; }')
 
-                    a('table.results { font-family: monospace; text-align: left; font-size: 8px; line-height: 15px; border-collapse: collapse; border-spacing: 0px; }')
-                    a('table.results td { padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 15px; }')
+                    a('table.results { overflow-y: clip; font-family: monospace; text-align: left; font-size: 8px; line-height: 15px; border-collapse: collapse; border-spacing: 0px; }')
+                    a('table.results td { position: relative; padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 15px; }')
                     a('table.results tr { padding: 0px; margin: 0px; white-space: nowrap;}')
-                    a('table.results th { padding: 0px; margin: 0px; white-space: nowrap;}')
+                    a('table.results th { position: relative; padding: 0px; margin: 0px; white-space: nowrap;}')
+                    a('table.results tr:hover { color:blue; background-color: #ffa; }')
+                    a('''
+table.results td:hover::after,
+th:hover::after {
+  content: "";
+  position: absolute;
+  background-color: #ffa;
+  left: 0;
+  top: -5000px;
+  height: 10000px;
+  width: 100%;
+  z-index: -1;
+}                    
+                    ''')
+
+
+                    a('''
+.styled-table {
+    border-collapse: collapse;
+    margin: 25px 0;
+    font-size: 0.9em;
+    font-family: sans-serif;
+    min-width: 400px;
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.15);
+}
+
+.styled-table thead tr {
+    background-color: #009879;
+    color: #ffffff;
+    text-align: left;
+}
+
+.styled-table th,
+.styled-table td {
+    padding: 12px 15px;
+}
+
+.styled-table tbody tr {
+    border-bottom: 1px solid #dddddd;
+}
+
+.styled-table tbody tr:nth-of-type(even) {
+    background-color: #f3f3f3;
+}
+
+.styled-table tbody tr:last-of-type {
+    border-bottom: 2px solid #009879;
+}
+
+.styled-table tbody tr.active-row {
+    font-weight: bold;
+    color: #009879;
+}
+                    ''')
             with a.body():
                 with a.h3():
-                    a(f'Test: {test_name} ({test_id}')
+                    a(f'Test: {test_name} ({test_id})')
 
                 with a.h4():
                     a(f'Upgrade: {upgrade}')
@@ -815,7 +848,7 @@ def analyze_test_id(name_group_commits):
                     a(f'Arch: {arch}')
 
                 if len(z) > 0:
-                    release_stream_prefix = PayloadStreams.split(list(z.keys())[0])[0]  # prefix of first release in results; this should be the same for all other releases in the results.
+                    release_stream_prefix = ReleasePayloadStreams.split(list(z.keys())[0])[0]  # prefix of first release in results; this should be the same for all other releases in the results.
                     with a.h5():
                         a(f'Release Stream: {release_stream_prefix}')
 
@@ -825,11 +858,13 @@ def analyze_test_id(name_group_commits):
                         for release_name in z.keys():
                             with a.th(klass='release-name'):
                                 with a.div():
-                                    release_name_suffix = PayloadStreams.split(release_name)[1]
-                                    a.span(_t=release_name_suffix)
+                                    release_name_suffix = ReleasePayloadStreams.split(release_name)[1]
+                                    with a.a(href=f'#{release_name}'):
+                                        a.span(_t=release_name_suffix)
 
                     commit_encountered_counts: Dict[str, int] = dict()
 
+                    commits_introduced_during_window = 0
                     for source_location in source_locations.keys():
                         if source_location in unchanged_source_locations:
                             continue
@@ -840,54 +875,152 @@ def analyze_test_id(name_group_commits):
                                 fe10, msg, c = z_entry[source_location]
                                 commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
                                 with a.td(title=msg):
-                                    if c.parent is None:
-                                        a.div(klass='rb-unknown')
-                                    elif commit_encountered_count == 0:
-                                        a.div(klass='rb-new', style=f'background-color:{fe10_color(fe10)};')
-                                    elif commit_encountered_count == 1 or fe10 < 0.0:
-                                        a.div(klass='rb', style=f'background-color:{fe10_color(fe10)};')
-                                    else:
-                                        a.div(klass='rb')
+                                    with a.a(href=f'#{c.commit_id}'):
+                                        if c.parent is None:
+                                            a.div(klass='rb-unknown')
+                                        elif commit_encountered_count == 0:
+                                            a.div(klass='rb-new', style=f'background-color:{fe10_color(fe10)};')
+                                            commits_introduced_during_window += 1
+                                        elif commit_encountered_count == 1 or fe10 < 0.0:
+                                            a.div(klass='rb', style=f'background-color:{fe10_color(fe10)};')
+                                        else:
+                                            a.div(klass='rb')
                                 commit_encountered_count += 1
                                 commit_encountered_counts[c.commit_id] = commit_encountered_count
 
+                a.h2(_t='Commit Details (Highest Possibility of Regression to Lowest)')
+                for c in by_le_grande_order:
+                    with a.div():
+                        with a.a(id=c.commit_id):
+                            a.h3(_t=f'Commit: {c.repo_name} {c.commit_id}')
+
+                        with a.table(klass='styled-table'):
+
+                            with a.tr():
+                                a.th(_t='Info')
+                                a.th(_t='Value')
+
+                            with a.tr():
+                                a.td(_t='Link')
+                                with a.td():
+                                    a.a(href=c.github_link(), _t=c.github_link())
+
+                            with a.tr():
+                                a.td(_t='Commit Date')
+                                a.td(_t=str(c.created_at))
+
+                            regression, resolution_outcomes = c.regression_info
+                            if regression:
+                                with a.tr():
+                                    a.td(_t='Regression')
+                                    a.td(_t=str(regression))
+
+                                with a.tr():
+                                    a.td(_t='Regression Resolution')
+                                    with a.td():
+                                        if resolution_outcomes:
+                                            a.a(href=f'#{resolution_outcomes.commit_id}', _t=f'{resolution_outcomes.repo_name} {resolution_outcomes.commit_id}')
+
+                            with a.tr():
+                                a.td(_t='Parent')
+                                with a.td():
+                                    if c.get_parent_commit_id():
+                                        a.a(href=f'#{c.get_parent_commit_id()}', _t=c.get_parent_commit_id())
+
+                            with a.tr():
+                                a.td(_t='Child')
+                                with a.td():
+                                    if c.get_child_commit_id():
+                                        a.a(href=f'#{c.get_child_commit_id()}', _t=c.get_child_commit_id())
+
+                            if len(c.release_streams[ReleasePayloadStreams.NIGHTLY_PAYLOAD]) > 0:
+                                with a.tr():
+                                    a.td(_t='First Nightly')
+                                    with a.td():
+                                        release_name = list(c.release_streams[ReleasePayloadStreams.NIGHTLY_PAYLOAD].keys())[0]
+                                        a.a(href=f'#{release_name}', _t=release_name)
+
+                            if len(c.release_streams[ReleasePayloadStreams.CI_PAYLOAD]) > 0:
+                                with a.tr():
+                                    a.td(_t='First CI Payload')
+                                    with a.td():
+                                        release_name = list(c.release_streams[ReleasePayloadStreams.CI_PAYLOAD].keys())[0]
+                                        a.a(href=f'#{release_name}', _t=release_name)
+
+                            def render_test_run(row):
+                                for _ in range(row['flake_count']):
+                                    a.a(href=prowjob_url(row), _t='f', target="_blank")
+                                if row['success_val'] > 0:
+                                    a.a(href=prowjob_url(row), _t='S', target="_blank")
+                                elif row['flake_count'] == 0:
+                                    a.a(href=prowjob_url(row), _t='F', target="_blank")
+
+                            if c.fe10 >= 0.90 or c.fe10 <= -0.90:
+                                with a.tr():
+                                    a.td(_t='Test Runs (all)')
+                                    with a.td(style='font-family: monospace; text-align: left;'):
+                                        test_run_count = 0
+                                        for _, row in c.tests_against_this_commit.iterrows():
+                                            render_test_run(row)
+                                            test_run_count += 1
+                                            if test_run_count % 20 == 0:
+                                                a.br()
+
+                                for stream in ReleasePayloadStreams:
+                                    with a.tr():
+                                        a.td(_t=f'Test Runs ({stream.value})')
+                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                            test_run_count = 0
+                                            for _, row in c.tests_against_this_commit.iterrows():
+                                                if ReleasePayloadStreams.get_stream(row['release_name']) is not stream:
+                                                    continue
+                                                render_test_run(row)
+                                                test_run_count += 1
+                                                if test_run_count % 20 == 0:
+                                                    a.br()
+
+                        with a.table(klass='styled-table'):
+                            with a.tr():
+                                a.th(_t='Metric')
+                                a.th(_t='Value')
+                                a.th(_t='Before Commit')
+                                a.th(_t='After Commit')
+
+                            for window_size in (10, 20, 30):
+                                with a.tr():
+                                    a.td(_t=f'fe{window_size}')
+                                    a.td(_t=str(c.fe(window_size)))
+                                    a.td(_t=str(c.behind_outcome(window_size)))
+                                    a.td(_t=str(c.ahead_outcome_best(window_size)))
+
+                        a.br()
+                        a.br()
+
+                a.h2('Release Details')
+                for release_name, release_payload in all_releases.items():
+                    with a.div():
+                        with a.a(id=release_name):
+                            a.h3(_t=f'Release: {release_name}')
+                        a.h4(_t='Commits Introduced')
+                        with a.table(klass='styled-table'):
+                            with a.tr():
+                                a.th(_t='Repo')
+                                a.th(_t='Commit')
+                                a.th(_t='Value (10)')
+                                a.th(_t='Before Commit (10)')
+                                a.th(_t='After Commit (10)')
+                            for commit_id in sorted(release_payload.diff_commits, key=lambda cid: all_commits[cid].fe10):
+                                with a.tr():
+                                    c = all_commits[commit_id]
+                                    a.td(_t=c.repo_name)
+                                    with a.td():
+                                        a.a(href=f'#{c.commit_id}', _t=c.commit_id)
+                                    a.td(_t=str(c.fe10))
+                                    a.td(_t=str(c.behind_outcome(10)))
+                                    a.td(_t=str(c.ahead_outcome_best(10)))
+
         with open('airium.html', mode='w+') as f:
             f.write(str(a))
-
-        try:
-            # fig = px.imshow(z)
-            fig = go.Figure(data=go.Heatmap(
-                z=df_z.values,
-                text=df_commit_ids,
-                # x=source_locations,
-                # y=list(release_names.keys())
-            ))
-            fig.update_layout(
-                yaxis=dict(
-                    visible=False,
-                ),
-                xaxis=dict(
-                    visible=False,
-                )
-            )
-            fig.show()
-            pass
-            # fig = go.Figure(data=[go.Surface(z=z)])
-            # fig.update_layout(title='Mt Bruno Elevation',
-            #                   autosize=False,
-            #                   # xaxis=dict(
-            #                   #     tickmode='auto',
-            #                   #     nticks=len(source_locations),
-            #                   # ),
-            #                   # yaxis=dict(
-            #                   #     tickmode='auto',
-            #                   #     nticks=len(release_names),
-            #                   # ),
-            #                   width=1200, height=1200,
-            #                   margin=dict(l=65, r=50, b=65, t=90))
-            # fig.show()
-        except Exception as e:
-            traceback.print_exc()
 
 
 if __name__ == '__main__':
@@ -1016,9 +1149,11 @@ if __name__ == '__main__':
                         release_name,
                         release_created,
                         0 AS is_pr, 
-                        "N/A" as pr_sha
+                        "N/A" as pr_sha,
+                        jobs.prowjob_url as prowjob_url
                 FROM    `openshift-gce-devel.ci_analysis_us.junit` junit 
                         INNER JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
+                        INNER JOIN `openshift-gce-devel.ci_analysis_us.jobs` jobs ON junit.prowjob_build_id = jobs.prowjob_build_id 
                 WHERE   arch LIKE "{LIMIT_ARCH}"
                         AND network LIKE "{LIMIT_NETWORK}"
                         AND junit.modified_time {scan_period}
@@ -1045,7 +1180,8 @@ if __name__ == '__main__':
                         release_name,
                         release_created,
                         1 AS is_pr,
-                        jobs.pr_sha AS pr_sha
+                        jobs.pr_sha AS pr_sha,
+                        jobs.prowjob_url as prowjob_url
                 FROM    `openshift-gce-devel.ci_analysis_us.junit_pr` junit_pr 
                         INNER JOIN payload_components ON junit_pr.prowjob_build_id = payload_components.pjbi
                         INNER JOIN `openshift-gce-devel.ci_analysis_us.jobs` jobs ON junit_pr.prowjob_build_id = jobs.prowjob_build_id 
