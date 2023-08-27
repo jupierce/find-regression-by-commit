@@ -780,16 +780,16 @@ def analyze_test_id(name_group_commits):
                 a.meta(charset='utf-8')
                 a.title(_t=qtest_id)
                 with a.style():
-                    a('.rb { width: 15px; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
-                    a('.rb-unknown { width: 15px; height: 10px; border: 0px solid #888; background-color: #eee; box-sizing: border-box;}')  # Used for commits which do not have a commit before them; thus no information to make regression determination.
-                    a('.rb-new { width: 15px; height: 10px; border: 2px solid #000; box-sizing: border-box; }')  # Highlights newly introduced commits
+                    a('.rb { width: inherit; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
+                    a('.rb-unknown { border: 0px solid #888; background-color: #eee;}')  # Used for commits which do not have a commit before them; thus no information to make regression determination.
+                    a('.rb-new { border: 2px solid #000; }')  # Highlights newly introduced commits
 
                     a('th.release-name { height: 140px; white-space: nowrap; }')
                     a('th.release-name > div { transform: translate(0px, 51px) rotate(315deg); width: 15px; }')
                     a('th.release-name > div > span { border-bottom: 1px solid #ccc; }')
 
-                    a('table.results { overflow-y: clip; font-family: monospace; text-align: left; font-size: 8px; line-height: 15px; border-collapse: collapse; border-spacing: 0px; }')
-                    a('table.results td { position: relative; padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 15px; }')
+                    a('table.results { overflow-y: clip; font-family: monospace; text-align: left; font-size: 8px; line-height: 15px; border-collapse: collapse; border-spacing: 0px; width: 80%; }')
+                    a('table.results td { position: relative; padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: inherit; }')
                     a('table.results tr { padding: 0px; margin: 0px; white-space: nowrap;}')
                     a('table.results th { position: relative; padding: 0px; margin: 0px; white-space: nowrap;}')
                     a('table.results tr:hover { color:blue; background-color: #ffa; }')
@@ -798,7 +798,7 @@ def analyze_test_id(name_group_commits):
 a.success:link, a.success:visited {
     color: green;
 }                    
-a.failure:link, a.success:visited {
+a.failure:link, a.failure:visited {
     color: red;
 }                    
 a.flake:link, a.flake:visited {
@@ -904,15 +904,17 @@ th:hover::after {
                                 commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
                                 with a.td(title=msg):
                                     with a.a(href=f'#{c.commit_id}'):
+                                        classes = 'rb'
+                                        style = ''
                                         if c.parent is None:
-                                            a.div(klass='rb-unknown')
+                                            classes += ' rb-unknown'
                                         elif commit_encountered_count == 0:
-                                            a.div(klass='rb-new', style=f'background-color:{fe10_color(fe10)};')
+                                            classes += ' rb-new'
+                                            style = f'background-color:{fe10_color(fe10)};'
                                             commits_introduced_during_window += 1
                                         elif commit_encountered_count == 1 or fe10 < 0.0:
-                                            a.div(klass='rb', style=f'background-color:{fe10_color(fe10)};')
-                                        else:
-                                            a.div(klass='rb')
+                                            style = f'background-color:{fe10_color(fe10)};'
+                                        a.div(klass=classes, style=style)
                                 commit_encountered_count += 1
                                 commit_encountered_counts[c.commit_id] = commit_encountered_count
 
