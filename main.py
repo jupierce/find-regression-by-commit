@@ -700,8 +700,7 @@ def analyze_test_id(name_group_commits):
 
         commit_ids = []
         z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
-        release_names: OrderedDict[str, bool] = OrderedDict()  # y axis
-        source_locations: List = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
+        source_locations: OrderedDict[str, bool] = None  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
 
         release_info = nurp_group.sort_values(by=['release_created'], ascending=[True])
 
@@ -716,10 +715,9 @@ def analyze_test_id(name_group_commits):
                 continue
 
             if not source_locations:
-                source_locations = sorted(list(t.source_locations))
-                unchanged_source_locations.update(source_locations)  # Assume every source location does not have more than one commit until proven later.
-
-            release_created = t.release_created
+                sorted_source_locations = sorted(list(t.source_locations))
+                source_locations = OrderedDict({sl: True for sl in sorted_source_locations})
+                unchanged_source_locations.update(sorted_source_locations)  # Assume every source location does not have more than one commit until proven later.
 
             commit_outcomes: List[CommitOutcomes] = list()
             for commit_id in t.commits:
@@ -731,7 +729,7 @@ def analyze_test_id(name_group_commits):
 
             z_entry: OrderedDict[str, Tuple] = OrderedDict()
             commits_entry = []
-            for source_location in source_locations:
+            for source_location in source_locations.keys():
                 c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
                 if c:
                     # ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
@@ -781,17 +779,6 @@ def analyze_test_id(name_group_commits):
                 b = 0
             return f'#{r:0>2X}{g:0>2X}{b:0>2X}'
 
-        repos_by_first_letter: OrderedDict[str, OrderedDict[str, bool]] = OrderedDict()
-        for source_location in source_locations:
-            if source_location in unchanged_source_locations:
-                continue
-
-            repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
-            first_letter = repo_name[:1]
-            if first_letter not in repos_by_first_letter:
-                repos_by_first_letter[first_letter] = OrderedDict()
-            repos_by_first_letter[first_letter][repo_name] = True
-
         a = Airium()
         a('<!DOCTYPE html>')
         with a.html():
@@ -799,11 +786,16 @@ def analyze_test_id(name_group_commits):
                 a.meta(charset='utf-8')
                 a.title(_t=qtest_id)
                 with a.style():
-                    a('.rb { width: 8px; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
-                    a('.rb-unknown { width: 8px; height: 10px; border: 0px solid #888; background-color: #eee; box-sizing: border-box;}')
-                    a('.rb-new { width: 8px; height: 10px; border: 1px solid #00d; box-sizing: border-box; }')
-                    a('table.results { font-family: monospace; text-align: left; font-size: 8px; line-height: 10px; border-collapse: collapse; border-spacing: 0px; }')
-                    a('table.results td { padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 11px; }')
+                    a('.rb { width: 15px; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
+                    a('.rb-unknown { width: 15px; height: 10px; border: 0px solid #888; background-color: #eee; box-sizing: border-box;}')
+                    a('.rb-new { width: 15px; height: 10px; border: 1px solid #00d; box-sizing: border-box; }')
+
+                    a('th.release-name { height: 140px; white-space: nowrap; }')
+                    a('th.release-name > div { transform: translate(0px, 51px) rotate(315deg); width: 15px; }')
+                    a('th.release-name > div > span { border-bottom: 1px solid #ccc; }')
+
+                    a('table.results { font-family: monospace; text-align: left; font-size: 8px; line-height: 15px; border-collapse: collapse; border-spacing: 0px; }')
+                    a('table.results td { padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 15px; }')
                     a('table.results tr { padding: 0px; margin: 0px; white-space: nowrap;}')
                     a('table.results th { padding: 0px; margin: 0px; white-space: nowrap;}')
             with a.body():
@@ -829,24 +821,23 @@ def analyze_test_id(name_group_commits):
 
                 with a.table(klass="results"):
                     with a.tr():
-                        a.th(_t='release')
-                        for first_letter, sl_list in repos_by_first_letter.items():
-                            a.th(_t=first_letter, colspan=f'{len(sl_list)}')
-
-                    with a.tr():
-                        a.th(_t='')  # release column
-                        for _, sl_list in repos_by_first_letter.items():
-                            for repo_name in sl_list:
-                                a.th(_t=repo_name[1:2], title=repo_name)  # second letter
+                        a.th(_t='source')
+                        for release_name in z.keys():
+                            with a.th(klass='release-name'):
+                                with a.div():
+                                    release_name_suffix = PayloadStreams.split(release_name)[1]
+                                    a.span(_t=release_name_suffix)
 
                     commit_encountered_counts: Dict[str, int] = dict()
-                    for release_name, z_entry in z.items():
+
+                    for source_location in source_locations.keys():
+                        if source_location in unchanged_source_locations:
+                            continue
                         with a.tr():
-                            a.td(_t=PayloadStreams.split(release_name)[1])  # release name suffix
-                            for source_location, item_tuple in z_entry.items():
-                                fe10, msg, c = item_tuple
-                                if source_location in unchanged_source_locations:
-                                    continue
+                            repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
+                            a.td(_t=repo_name)
+                            for z_entry in z.values():
+                                fe10, msg, c = z_entry[source_location]
                                 commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
                                 with a.td(title=msg):
                                     if c.parent is None:
