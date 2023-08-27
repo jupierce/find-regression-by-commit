@@ -176,6 +176,7 @@ class CommitOutcomes:
         self.index_last_self_test_in_records = 0
 
         self.discrete_outcomes: Optional[OutcomePair] = None
+        self.tests_against_this_commit: Optional[pandas.DataFrame] = None
 
         self.release_streams: Dict[PayloadStreams, OrderedDict[str, bool]] = {
             PayloadStreams.NIGHTLY_PAYLOAD: OrderedDict(),  # We really just want an Ordered Set. Value doesn't matter.
@@ -186,11 +187,11 @@ class CommitOutcomes:
     def set_data(self, repo_test_records: pandas.DataFrame):
         self.repo_test_records = repo_test_records
 
-        tests_against_this_commit = self.repo_test_records[self.repo_test_records['commits'] == self.commit_id]
-        self.discrete_outcomes = self.outcome_sums(tests_against_this_commit)
+        self.tests_against_this_commit = self.repo_test_records[self.repo_test_records['commits'] == self.commit_id]
+        self.discrete_outcomes = self.outcome_sums(self.tests_against_this_commit)
 
-        self.index_first_self_test_in_records = tests_against_this_commit.first_valid_index()
-        self.index_last_self_test_in_records = tests_against_this_commit.last_valid_index()
+        self.index_first_self_test_in_records = self.tests_against_this_commit.first_valid_index()
+        self.index_last_self_test_in_records = self.tests_against_this_commit.last_valid_index()
 
     def record_observation_in_release(self, release_name: str):
         stream_name = PayloadStreams.get_stream(release_name)
@@ -243,6 +244,9 @@ class CommitOutcomes:
 
     def ahead(self, count: int, mode: Mode = Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS, after_date: Optional[numpy.datetime64] = None) -> pandas.DataFrame:
         outcomes: Optional[pandas.DataFrame] = None
+
+        # if self.index_last_self_test_in_records - self.index_first_self_test_in_records >= count:
+        #     return self.tests_against_this_commit
 
         if after_date:
             # If date filtering is being used, the caller cares about specific time periods, so we
@@ -730,8 +734,8 @@ def analyze_test_id(name_group_commits):
             for source_location in source_locations:
                 c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
                 if c:
-                    ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
-                    # ahead_outcome = c.ahead_outcome_best(10)
+                    # ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
+                    ahead_outcome = c.ahead_outcome_best(10)
                     # fe10 = c.fe10
                     behind_outcome = c.behind_outcome(10)
 
@@ -767,11 +771,11 @@ def analyze_test_id(name_group_commits):
             r = 0xff
             g = 0xff
             b = 0xff
-            if fe10 < -0.1:
+            if fe10 < -0.90:
                 r = 100 + int(155 * (1 - abs(fe10)))
                 g = 0
                 b = 0
-            if fe10 > 0.1:
+            if fe10 > 0.90:
                 r = 0
                 g = 100 + int(155 * (1 - abs(fe10)))
                 b = 0
@@ -796,7 +800,8 @@ def analyze_test_id(name_group_commits):
                 a.title(_t=qtest_id)
                 with a.style():
                     a('.rb { width: 8px; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
-                    a('.rb-new { width: 8px; height: 10px; border: 2px solid #00d; box-sizing: border-box; }')
+                    a('.rb-unknown { width: 8px; height: 10px; border: 0px solid #888; background-color: #eee; box-sizing: border-box;}')
+                    a('.rb-new { width: 8px; height: 10px; border: 1px solid #00d; box-sizing: border-box; }')
                     a('table.results { font-family: monospace; text-align: left; font-size: 8px; line-height: 10px; border-collapse: collapse; border-spacing: 0px; }')
                     a('table.results td { padding: 0px; margin: 0px; white-space: nowrap; height: 10px; width: 11px; }')
                     a('table.results tr { padding: 0px; margin: 0px; white-space: nowrap;}')
@@ -834,22 +839,26 @@ def analyze_test_id(name_group_commits):
                             for repo_name in sl_list:
                                 a.th(_t=repo_name[1:2], title=repo_name)  # second letter
 
-                    commits_encountered: Set[str] = set()
+                    commit_encountered_counts: Dict[str, int] = dict()
                     for release_name, z_entry in z.items():
                         with a.tr():
                             a.td(_t=PayloadStreams.split(release_name)[1])  # release name suffix
                             for source_location, item_tuple in z_entry.items():
-                                item, msg, c = item_tuple
+                                fe10, msg, c = item_tuple
                                 if source_location in unchanged_source_locations:
                                     continue
-                                new_commit = c.commit_id not in commits_encountered
-                                if new_commit:
-                                    commits_encountered.add(c.commit_id)
+                                commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
                                 with a.td(title=msg):
-                                    if new_commit:
-                                        a.div(klass='rb-new', style=f'background-color:{fe10_color(item)};')
+                                    if c.parent is None:
+                                        a.div(klass='rb-unknown')
+                                    elif commit_encountered_count == 0:
+                                        a.div(klass='rb-new', style=f'background-color:{fe10_color(fe10)};')
+                                    elif commit_encountered_count == 1 or fe10 < 0.0:
+                                        a.div(klass='rb', style=f'background-color:{fe10_color(fe10)};')
                                     else:
-                                        a.div(klass='rb', style=f'background-color:{fe10_color(item)};')
+                                        a.div(klass='rb')
+                                commit_encountered_count += 1
+                                commit_encountered_counts[c.commit_id] = commit_encountered_count
 
         with open('airium.html', mode='w+') as f:
             f.write(str(a))
