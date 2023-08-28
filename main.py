@@ -9,6 +9,8 @@ from enum import Enum
 import time
 import re
 import pathlib
+import functools
+import weakref
 
 import numpy
 import tqdm
@@ -20,7 +22,7 @@ import itertools
 import pandas
 from google.cloud import bigquery
 from fast_fisher import fast_fisher_cython
-from functools import cached_property, lru_cache
+from functools import cached_property
 
 pandas.options.compute.use_numexpr = True
 
@@ -34,6 +36,23 @@ class Mode(Enum):
 
 
 RELEASE_NAME_SPLIT_REGEX = re.compile(r"(.*-0\.[^-]+)-(.*)")
+
+
+def memoized_method(*lru_args, **lru_kwargs):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapped_func(self, *args, **kwargs):
+            # We're storing the wrapped method inside the instance. If we had
+            # a strong reference to self the instance would never die.
+            self_weak = weakref.ref(self)
+            @functools.wraps(func)
+            @functools.lru_cache(*lru_args, **lru_kwargs)
+            def cached_method(*args, **kwargs):
+                return func(self_weak(), *args, **kwargs)
+            setattr(self, func.__name__, cached_method)
+            return cached_method(*args, **kwargs)
+        return wrapped_func
+    return decorator
 
 
 class ReleasePayloadStreams(Enum):
@@ -388,7 +407,7 @@ class CommitOutcomes:
     #    a commit causing a regression, then the earlier test records will be preferred
     #    by _best.
 
-    @lru_cache(maxsize=10)
+    @memoized_method(maxsize=10)
     def ahead_outcome_best(self, count: int) -> OutcomePair:
         original_outcome = OutcomePair.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS))
         newest_outcome = OutcomePair.outcome_sums(self.ahead(count=count, mode=Mode.PRIORITIZE_NEWEST_TEST_RESULTS))
@@ -406,11 +425,11 @@ class CommitOutcomes:
         outcomes = self.repo_test_records.iloc[starting_index:min(starting_index+count, self.index_first_self_test_in_records)]
         return outcomes
 
-    @lru_cache(maxsize=10)
+    @memoized_method(maxsize=10)
     def behind_outcome(self, count: Optional[int] = None) -> OutcomePair:
         return OutcomePair.outcome_sums(self.behind(count=count))
 
-    @lru_cache(maxsize=10)
+    @memoized_method(maxsize=10)
     def fe(self, window_size: int) -> float:
         return self.ahead_outcome_best(count=window_size).fishers_exact(self.behind_outcome(count=window_size))
 
@@ -536,10 +555,10 @@ ReleaseName = str
 INCLUDE_PR_TESTS = True
 LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = '%'  # 'ovn'
-LIMIT_PLATFORM = 'gcp'
+LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 # LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
-# LIMIT_TEST_ID_SUFFIXES = list('56789')  # ids end with a hex digit, so cover everything.
+# LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
 LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 
 
@@ -662,18 +681,18 @@ def analyze_test_id(name_group_commits):
 
         for c in by_le_grande_order:
             relevant_count += 1
-            print(f'{le_grande_order(c)}')
+            # print(f'{le_grande_order(c)}')
             regressed, resolution = c.regression_info
             if regressed and not resolution:
                 unresolved_regression.append(c)
             if regressed and resolution:
                 resolved_regression.append(c)
-            print(c)
-            print()
+            # print(c)
+            # print()
 
-        print(f'Found {relevant_count}')
-        print(f'Found {len(unresolved_regression)}')
-        print(f'Found {len(resolved_regression)}')
+        # print(f'Found {relevant_count}')
+        # print(f'Found {len(unresolved_regression)}')
+        # print(f'Found {len(resolved_regression)}')
 
         analysis_path = pathlib.Path('analysis')
         analysis_path.mkdir(parents=True, exist_ok=True)
