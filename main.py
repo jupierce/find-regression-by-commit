@@ -558,8 +558,8 @@ LIMIT_NETWORK = '%'  # 'ovn'
 LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 # LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
-# LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
-LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
+LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
+# LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 
 
 def analyze_test_id(name_group_commits):
@@ -714,67 +714,9 @@ def analyze_test_id(name_group_commits):
         output_base.mkdir(parents=True, exist_ok=True)
         output_path = output_base.joinpath(f'{qtest_id}.html')
 
-        commit_ids = []
-        z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
-        source_locations: OrderedDict[str, bool] = OrderedDict()  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
-
         release_info = nurp_group.sort_values(by=['release_created'], ascending=[True])
 
         unchanged_source_locations: Set[str] = set()
-
-        for t in release_info.itertuples():
-            if ReleasePayloadStreams.get_stream(t.release_name) != ReleasePayloadStreams.NIGHTLY_PAYLOAD:
-                continue
-
-            if t.release_name in z:
-                # We've already included an analysis of commits relative to this release's release_created date.
-                continue
-
-            if not source_locations:
-                sorted_source_locations = sorted(list(t.source_locations))
-                source_locations.update({sl: True for sl in sorted_source_locations})
-                unchanged_source_locations.update(sorted_source_locations)  # Assume every source location does not have more than one commit until proven later.
-
-            commit_outcomes: List[CommitOutcomes] = list()
-            for commit_id in t.commits:
-                commit_outcomes.append(all_commits[commit_id])
-
-            # We need to take care to tolerate if there are new / missing source locations,
-            # but this should be exceedingly rare.
-            commit_outcomes_by_source_location = {commit.source_location: commit for commit in commit_outcomes}
-
-            z_entry: OrderedDict[str, Tuple] = OrderedDict()
-            commits_entry = []
-            for source_location in source_locations.keys():
-                c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
-                if c:
-                    # ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
-                    ahead_outcome = c.ahead_outcome_best(10)
-                    # fe10 = c.fe10
-                    behind_outcome = c.behind_outcome(10)
-
-                    if behind_outcome.failure_count + behind_outcome.success_count > 0:
-                        if source_location in unchanged_source_locations:
-                            # There is at least one commit in this source location that has test runs
-                            # before it was introduced. Make sure to include it in the visualizations /
-                            # analysis.
-                            # This is useful to reduce the amount of information displayed by excluding
-                            # repos that did not change at all during the scan window.
-                            unchanged_source_locations.remove(source_location)
-                        fe10 = ahead_outcome.fishers_exact(behind_outcome)
-                    else:
-                        fe10 = math.nan  # If there is nothing behind to compare against, fe is meaningless.
-
-                    # msg = 'ahead:' + str(ahead_outcome) + '&#010;' + 'behind:' + str(behind_outcome) + '&#010;' + 'fe10:' + str(c.fe10) + '&#010;' + source_location + '&#010;' + c.commit_id + '&#010;' + t.release_name
-                    msg = 'ahead:' + str(ahead_outcome) + '&#010;' + 'behind:' + str(
-                        behind_outcome) + '&#010;' + 'fe10:' + str(
-                        fe10) + '&#010;' + source_location + '&#010;' + c.commit_id + '&#010;' + t.release_name
-                    z_entry[source_location] = (fe10, msg, c)
-                else:
-                    z_entry[source_location] = (0.0, '?', None)
-
-            z[t.release_name] = z_entry
-            commit_ids.append(commits_entry)
 
         def fe10_color(fe10):
             if math.isnan(fe10):
@@ -900,48 +842,105 @@ th:hover::after {
                 with a.h4():
                     a(f'Arch: {arch}')
 
-                if len(z) > 0:
-                    release_stream_prefix = ReleasePayloadStreams.split(list(z.keys())[0])[0]  # prefix of first release in results; this should be the same for all other releases in the results.
-                    with a.h5():
-                        a(f'Release Stream: {release_stream_prefix}')
+                for release_stream in (ReleasePayloadStreams.CI_PAYLOAD, ReleasePayloadStreams.NIGHTLY_PAYLOAD):
+                    z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
+                    source_locations: OrderedDict[str, bool] = OrderedDict()  # x axis. It is assumed that the source_locations will not change in a given stream over the span of our results
 
-                with a.table(klass="results"):
-                    with a.tr():
-                        a.th(_t='source')
-                        for release_name in z.keys():
-                            with a.th(klass='release-name'):
-                                with a.div():
-                                    release_name_suffix = ReleasePayloadStreams.split(release_name)[1]
-                                    with a.a(href=f'#{release_name}'):
-                                        a.span(_t=release_name_suffix)
-
-                    commit_encountered_counts: Dict[str, int] = dict()
-
-                    commits_introduced_during_window = 0
-                    for source_location in source_locations.keys():
-                        if source_location in unchanged_source_locations:
+                    for t in release_info.itertuples():
+                        if ReleasePayloadStreams.get_stream(t.release_name) is not release_stream:
                             continue
+
+                        if t.release_name in z:
+                            # We've already included an analysis of commits relative to this release's release_created date.
+                            continue
+
+                        if not source_locations:
+                            sorted_source_locations = sorted(list(t.source_locations))
+                            source_locations.update({sl: True for sl in sorted_source_locations})
+                            unchanged_source_locations.update(sorted_source_locations)  # Assume every source location does not have more than one commit until proven later.
+
+                        commit_outcomes: List[CommitOutcomes] = list()
+                        for commit_id in t.commits:
+                            commit_outcomes.append(all_commits[commit_id])
+
+                        # We need to take care to tolerate if there are new / missing source locations,
+                        # but this should be exceedingly rare.
+                        commit_outcomes_by_source_location = {commit.source_location: commit for commit in commit_outcomes}
+
+                        z_entry: OrderedDict[str, Tuple] = OrderedDict()
+                        for source_location in source_locations.keys():
+                            c: CommitOutcomes = commit_outcomes_by_source_location.get(source_location, None)
+                            if c:
+                                # ahead_outcome = c.ahead_outcome(10, after_date=release_created, mode=Mode.PRIORITIZE_ORIGINAL_TEST_RESULTS)
+                                ahead_outcome = c.ahead_outcome_best(10)
+                                # fe10 = c.fe10
+                                behind_outcome = c.behind_outcome(10)
+
+                                if behind_outcome.failure_count + behind_outcome.success_count > 0:
+                                    if source_location in unchanged_source_locations:
+                                        # There is at least one commit in this source location that has test runs
+                                        # before it was introduced. Make sure to include it in the visualizations /
+                                        # analysis.
+                                        # This is useful to reduce the amount of information displayed by excluding
+                                        # repos that did not change at all during the scan window.
+                                        unchanged_source_locations.remove(source_location)
+                                    fe10 = ahead_outcome.fishers_exact(behind_outcome)
+                                else:
+                                    fe10 = math.nan  # If there is nothing behind to compare against, fe is meaningless.
+
+                                # msg = 'ahead:' + str(ahead_outcome) + '&#010;' + 'behind:' + str(behind_outcome) + '&#010;' + 'fe10:' + str(c.fe10) + '&#010;' + source_location + '&#010;' + c.commit_id + '&#010;' + t.release_name
+                                msg = 'ahead:' + str(ahead_outcome) + '&#010;' + 'behind:' + str(
+                                    behind_outcome) + '&#010;' + 'fe10:' + str(
+                                    fe10) + '&#010;' + source_location + '&#010;' + c.commit_id + '&#010;' + t.release_name
+                                z_entry[source_location] = (fe10, msg, c)
+                            else:
+                                z_entry[source_location] = (0.0, '?', None)
+
+                        z[t.release_name] = z_entry
+
+                    if len(z) > 0:
+                        release_stream_prefix = ReleasePayloadStreams.split(list(z.keys())[0])[0]  # prefix of first release in results; this should be the same for all other releases in the results.
+                        a.br()
+                        with a.h4():
+                            a(f'Release Stream: {release_stream_prefix}')
+
+                    with a.table(klass="results"):
                         with a.tr():
-                            repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
-                            a.td(_t=repo_name)
-                            for z_entry in z.values():
-                                fe10, msg, c = z_entry[source_location]
-                                commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
-                                with a.td(title=msg):
-                                    with a.a(href=f'#{c.commit_id}'):
-                                        classes = 'rb'
-                                        style = ''
-                                        if c.parent is None:
-                                            classes += ' rb-unknown'
-                                        elif commit_encountered_count == 0:
-                                            classes += ' rb-new'
-                                            style = f'background-color:{fe10_color(fe10)};'
-                                            commits_introduced_during_window += 1
-                                        elif commit_encountered_count == 1 or fe10 < 0.0:
-                                            style = f'background-color:{fe10_color(fe10)};'
-                                        a.div(klass=classes, style=style)
-                                commit_encountered_count += 1
-                                commit_encountered_counts[c.commit_id] = commit_encountered_count
+                            a.th(_t='source')
+                            for release_name in z.keys():
+                                with a.th(klass='release-name'):
+                                    with a.div():
+                                        release_name_suffix = ReleasePayloadStreams.split(release_name)[1]
+                                        with a.a(href=f'#{release_name}'):
+                                            a.span(_t=release_name_suffix)
+
+                        commit_encountered_counts: Dict[str, int] = dict()
+
+                        commits_introduced_during_window = 0
+                        for source_location in source_locations.keys():
+                            if source_location in unchanged_source_locations:
+                                continue
+                            with a.tr():
+                                repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
+                                a.td(_t=repo_name)
+                                for z_entry in z.values():
+                                    fe10, msg, c = z_entry[source_location]
+                                    commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
+                                    with a.td(title=msg):
+                                        with a.a(href=f'#{c.commit_id}'):
+                                            classes = 'rb'
+                                            style = ''
+                                            if c.parent is None:
+                                                classes += ' rb-unknown'
+                                            elif commit_encountered_count == 0:
+                                                classes += ' rb-new'
+                                                style = f'background-color:{fe10_color(fe10)};'
+                                                commits_introduced_during_window += 1
+                                            elif commit_encountered_count == 1 or fe10 < 0.0:
+                                                style = f'background-color:{fe10_color(fe10)};'
+                                            a.div(klass=classes, style=style)
+                                    commit_encountered_count += 1
+                                    commit_encountered_counts[c.commit_id] = commit_encountered_count
 
                 a.h2(_t='Unresolved Regressions')
                 if unresolved_regression:
@@ -1102,9 +1101,9 @@ th:hover::after {
 
 if __name__ == '__main__':
     scan_period_days = 14  # days
-    # before_datetime = datetime.datetime.utcnow()
+    before_datetime = datetime.datetime.utcnow()
     # TODO: REMOVE fixed date after testing
-    before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
+    # before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
     # before_datetime = datetime.datetime(2023, 7, 24, 4, 10, 0)  # This is a time shortly before the first test results including the revert to the Azure regression.
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
     before_str = before_datetime.strftime("%Y-%m-%d %H:%M:%S")
