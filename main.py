@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import multiprocessing
 import datetime
+import os
 from typing import NamedTuple, List, Dict, Set, Tuple, Optional
 from enum import Enum
 import time
@@ -1188,7 +1189,7 @@ if __name__ == '__main__':
         commits_ordinals[row.commit] = (count, row.created_at)
         count += 1
 
-    pool = multiprocessing.Pool(processes=16)
+    pool = multiprocessing.Pool(processes=os.cpu_count()-2)
     for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
         suffixed_records = f'''
             WITH junit_all AS(
