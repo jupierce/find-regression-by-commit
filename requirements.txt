@@ -1,0 +1,7 @@
+pandas
+numexpr
+cython
+fast-fisher
+google-cloud-bigquery
+tqdm
+arium

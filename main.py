@@ -570,6 +570,11 @@ def analyze_test_id(name_group_commits):
     for name, nurp_group in grouped_by_nurp:
         # print(f'Processing {name}')
 
+        failures_df = nurp_group[(nurp_group['success_val'] == 0) & (nurp_group['flake_count'] == 0)]
+        if len(failures_df.index) < 4:
+            # Extremely few failures. Ignore this nurp.
+            continue
+
         # As we visit each test, keep track of the commits we see in the payloads in the order
         # we see them. If we don't have definitive ordering information from github, we will
         # use the order in which commits are observed as a heuristic for parent/child links.
@@ -587,6 +592,7 @@ def analyze_test_id(name_group_commits):
         qtest_id = f"{network}_{upgrade}_{arch}_{platform}_{test_id}"
 
         for t in nurp_group.itertuples():
+
             source_locations = t.source_locations
             commits = list(t.commits)
 
@@ -1183,6 +1189,7 @@ if __name__ == '__main__':
         commits_ordinals[row.commit] = (count, row.created_at)
         count += 1
 
+    pool = multiprocessing.Pool(processes=16)
     for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
         suffixed_records = f'''
             WITH junit_all AS(
@@ -1303,9 +1310,7 @@ if __name__ == '__main__':
 
         print(f'There are {len(trusted_records)} records to process with suffix: {test_id_suffix}')
         grouped_by_test_id = trusted_records.groupby('test_id', sort=False)
-        pool = multiprocessing.Pool(processes=16)
         for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, zip(grouped_by_test_id, itertools.repeat(commits_ordinals))), total=len(grouped_by_test_id.groups)):
             pass
-        pool.close()
-        time.sleep(10)
+    pool.close()
 
