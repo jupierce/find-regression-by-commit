@@ -3,5 +3,7 @@ numexpr
 cython
 fast-fisher
 google-cloud-bigquery
+google-cloud-storage
 tqdm
-arium
+airium
+future

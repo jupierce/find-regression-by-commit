@@ -1310,6 +1310,7 @@ if __name__ == '__main__':
 
         print(f'There are {len(trusted_records)} records to process with suffix: {test_id_suffix}')
         grouped_by_test_id = trusted_records.groupby('test_id', sort=False)
+        print(f'{len(grouped_by_test_id.groups)} different test_ids in this suffix')
         for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, zip(grouped_by_test_id, itertools.repeat(commits_ordinals))), total=len(grouped_by_test_id.groups)):
             pass
     pool.close()
