@@ -559,8 +559,16 @@ LIMIT_NETWORK = '%'  # 'ovn'
 LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 # LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
-LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
+# LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
+LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
 # LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
+
+
+def process_queue(input_queue, commits_ordinals):
+    for name_group in iter(input_queue.get, 'STOP'):
+        name, _ = name_group
+        analyze_test_id((name_group, commits_ordinals))
+        print(f'Finished {name}')
 
 
 def analyze_test_id(name_group_commits):
@@ -1189,7 +1197,11 @@ if __name__ == '__main__':
         commits_ordinals[row.commit] = (count, row.created_at)
         count += 1
 
-    pool = multiprocessing.Pool(processes=os.cpu_count()-2)
+    queue = multiprocessing.Queue(os.cpu_count() * 4)
+    worker_pool = [multiprocessing.Process(target=process_queue, args=(queue, commits_ordinals)) for _ in range(os.cpu_count() - 2)]
+    for worker in worker_pool:
+        worker.start()
+
     for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
         suffixed_records = f'''
             WITH junit_all AS(
@@ -1311,7 +1323,11 @@ if __name__ == '__main__':
         print(f'There are {len(trusted_records)} records to process with suffix: {test_id_suffix}')
         grouped_by_test_id = trusted_records.groupby('test_id', sort=False)
         print(f'{len(grouped_by_test_id.groups)} different test_ids in this suffix')
-        for _ in tqdm.tqdm(pool.imap_unordered(analyze_test_id, zip(grouped_by_test_id, itertools.repeat(commits_ordinals))), total=len(grouped_by_test_id.groups)):
-            pass
-    pool.close()
+        for input_item in grouped_by_test_id:
+            queue.put(input_item)
 
+    for worker in worker_pool:
+        queue.put('STOP')
+
+    for worker in worker_pool:
+        worker.join()
