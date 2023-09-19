@@ -558,9 +558,11 @@ LIMIT_ARCH = 'amd64'
 LIMIT_NETWORK = '%'  # 'ovn'
 LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'  # 'upgrade-micro'
-# LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # ids end with a hex digit, so cover everything.
+
+# LIMIT_TEST_ID_SUFFIXES = [list('012345678'), list('90abcdef')]  # Process in two large groups
+LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
-LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
+# LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
 # LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
 
 
@@ -1189,6 +1191,23 @@ if __name__ == '__main__':
                 # Missing multiple days in github archive?
                 raise
 
+    query_commits_tested_by_non_pr_payloads = f'''
+    SELECT DISTINCT(tag_commit_id) as commit FROM `openshift-gce-devel.ci_analysis_us.job_releases` 
+        WHERE is_pr = false
+        AND release_name LIKE "4.14.%"
+        AND release_created {scan_period}
+    '''
+
+    print('Finding commits tested by non-pr release payloads')
+    commits_tested_by_non_pr_payloads_df = main_client.query(query_commits_tested_by_non_pr_payloads).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+    commits_tested_by_non_pr_payloads = commits_tested_by_non_pr_payloads_df['commit'].tolist()
+    print(f'Found {len(commits_tested_by_non_pr_payloads)} of them')
+
+    # Construct a definitive set including all commits that ultimately merged during
+    # our observation period.
+    merged_commits = set(commits_info['commit'].tolist())
+    merged_commits.update(commits_tested_by_non_pr_payloads)
+
     commits_ordinals: Dict[str, Tuple[int, datetime.datetime]] = dict()
     # Create a dict mapping each commit to an increasing integer. This will allow more
     # efficient lookup later when we need to know whether one commit came after another.
@@ -1197,16 +1216,34 @@ if __name__ == '__main__':
         commits_ordinals[row.commit] = (count, row.created_at)
         count += 1
 
-    queue = multiprocessing.Queue(os.cpu_count() * 4)
-    worker_pool = [multiprocessing.Process(target=process_queue, args=(queue, commits_ordinals)) for _ in range(os.cpu_count() - 2)]
+    queue = multiprocessing.Queue(os.cpu_count() * 300)
+    worker_pool = [multiprocessing.Process(target=process_queue, args=(queue, commits_ordinals)) for _ in range(max(os.cpu_count() - 2, 1))]
     for worker in worker_pool:
         worker.start()
 
     for test_id_suffix in LIMIT_TEST_ID_SUFFIXES:
+
+        if test_id_suffix == '*':
+            suffix_test = ''
+        elif type(test_id_suffix) != list:
+            # If it is not a list, turn it into one
+            test_id_suffix = [test_id_suffix]
+
+        # If an entry is like ['a', 'b', 'c'], then we want to convert that into a logical
+        # or 'ends_with(a) or ends_with(b) or ends_with(c)'.
+        if type(test_id_suffix) == list:
+            suffix_test = ''
+            for suffix in test_id_suffix:
+                suffix_test += f'OR ENDS_WITH(test_id, "{suffix}") '
+            suffix_test = suffix_test[3:]  # Strip initial OR
+
+        if suffix_test:
+            suffix_test = f'AND ({suffix_test})'
+
         suffixed_records = f'''
             WITH junit_all AS(
                 
-                # Find 4.14 prowjobs which tested payloads during the scan period. For each
+                # Find 4.x prowjobs which tested payloads during the scan period. For each
                 # payload, aggregate the commits it included into an array.
                 WITH payload_components AS(               
                     # Find all prowjobs which have run against a 4.14 payload commit
@@ -1247,7 +1284,7 @@ if __name__ == '__main__':
                 WHERE   arch LIKE "{LIMIT_ARCH}"
                         AND network LIKE "{LIMIT_NETWORK}"
                         AND junit.modified_time {scan_period}
-                        AND ENDS_WITH(test_id, "{test_id_suffix}")
+                        {suffix_test}
                         AND test_name NOT LIKE "%disruption%"
                         AND platform LIKE "{LIMIT_PLATFORM}" 
                         AND upgrade LIKE "{LIMIT_UPGRADE}" 
@@ -1278,7 +1315,7 @@ if __name__ == '__main__':
                 WHERE   arch LIKE "{LIMIT_ARCH}"
                         AND network LIKE "{LIMIT_NETWORK}"
                         AND junit_pr.modified_time {scan_period}
-                        AND ENDS_WITH(test_id, "{test_id_suffix}") 
+                        {suffix_test} 
                         AND test_name NOT LIKE "%disruption%" 
                         AND platform LIKE "{LIMIT_PLATFORM}" 
                         AND upgrade LIKE "{LIMIT_UPGRADE}" 
@@ -1289,19 +1326,8 @@ if __name__ == '__main__':
             ORDER BY modified_time ASC
     '''
 
-        # Construct a definitive set including all commits that ultimately merged during
-        # our observation period.
-        merged_commits = set(commits_info['commit'].tolist())
-
         print(f'Gathering test runs for suffix: {test_id_suffix}')
         all_records = main_client.query(suffixed_records).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
-
-        for row in all_records[all_records['is_pr'] == 0].itertuples():
-            # if a test ran outside of pre-merge testing, we can assume that
-            # any commits in the payload have previously merged (before our
-            # observation period. Add any such commits to the merged_commits
-            # set.
-            merged_commits.update(row.commits)
 
         all_record_count = len(all_records.index)
         pr_record_count = len(all_records[all_records['is_pr'] == 1])
@@ -1309,11 +1335,11 @@ if __name__ == '__main__':
         print(f'    PR Records {pr_record_count}')
 
         if INCLUDE_PR_TESTS:
-            # If a pr triggered test tests commits that are now a subset of all trusted / merged
-            # commits, then promote the pr test to a non-pr test.
-            for i, row in all_records.iterrows():
-                if row.is_pr == 1 and row.pr_sha in merged_commits:
-                    all_records.at[i, 'is_pr'] = 0
+            # If a pr triggered test tested commits that are now a subset of all trusted / merged
+            # commits, then promote the pr test result to a non-pr test result.
+            all_records.loc[
+                ((all_records['is_pr'] == 1) & (all_records['pr_sha'].isin(merged_commits))), 'is_pr'
+            ] = 0
 
         # Drop all records that were pre-merge tests containing untrusted commits.
         trusted_records = all_records[all_records['is_pr'] == 0]
