@@ -1,5 +1,13 @@
 #!/bin/bash
 
+if [[ "$1" == "" ]]; then
+  echo "Release must be specified"
+  echo "Syntax example: $0 4.14"
+  exit 1
+fi
+
+release="$1"
+
 gcloud compute instances create mechanical-deads-driver \
     --project=openshift-gce-devel \
     --zone=us-east1-c \
@@ -35,6 +43,6 @@ gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-de
 gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver -- chmod +x ~/*.py
 
 gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver -- ./install.sh
-gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver -- ./run-main.sh
+gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver -- ./run-main.sh ${release}
 
 gcloud compute instances delete --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver

@@ -7,12 +7,12 @@ import datetime
 import os
 from typing import NamedTuple, List, Dict, Set, Tuple, Optional
 from enum import Enum
-import time
 import re
 import pathlib
 import functools
 import weakref
 
+import click
 import numpy
 import tqdm
 from collections import OrderedDict
@@ -1110,7 +1110,9 @@ th:hover::after {
             f.write(str(a))
 
 
-if __name__ == '__main__':
+@click.command()
+@click.option('-r', '--release', help='OpenShift release to analyze (e.g. "4.15")')
+def cli(release):
     scan_period_days = 14  # days
     before_datetime = datetime.datetime.utcnow()
     # TODO: REMOVE fixed date after testing
@@ -1194,7 +1196,7 @@ if __name__ == '__main__':
     query_commits_tested_by_non_pr_payloads = f'''
     SELECT DISTINCT(tag_commit_id) as commit FROM `openshift-gce-devel.ci_analysis_us.job_releases` 
         WHERE is_pr = false
-        AND release_name LIKE "4.14.%"
+        AND release_name LIKE "{release}.%"
         AND release_created {scan_period}
     '''
 
@@ -1246,7 +1248,7 @@ if __name__ == '__main__':
                 # Find 4.x prowjobs which tested payloads during the scan period. For each
                 # payload, aggregate the commits it included into an array.
                 WITH payload_components AS(               
-                    # Find all prowjobs which have run against a 4.14 payload commit
+                    # Find all prowjobs which have run against a 4.x payload commit
                     # in the last two months. 
                     SELECT  prowjob_build_id as pjbi, 
                             ARRAY_AGG(tag_source_location) as source_locations, 
@@ -1255,7 +1257,7 @@ if __name__ == '__main__':
                             ANY_VALUE(release_created) as release_created 
                     FROM openshift-gce-devel.ci_analysis_us.job_releases jr
                     WHERE   release_created {scan_period}
-                            AND (release_name LIKE "4.14.0-0.nightly%" OR release_name LIKE "4.14.0-0.ci%")   
+                            AND (release_name LIKE "{release}.0-0.nightly%" OR release_name LIKE "{release}.0-0.ci%")   
                     GROUP BY prowjob_build_id
                 )
     
@@ -1357,3 +1359,7 @@ if __name__ == '__main__':
 
     for worker in worker_pool:
         worker.join()
+
+
+if __name__ == '__main__':
+    cli()
