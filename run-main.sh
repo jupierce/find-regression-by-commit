@@ -12,6 +12,6 @@ release="$1"
 day="$(date +%F)"
 hour="$(date +"%H-%M-%S")"
 
-mkdir -p "${day}"
+mkdir -p "${day}/${release}"
 mv analysis "${day}/${release}/${hour}"
 gsutil cp -r "${day}/${release}/${hour}"  "gs://origin-ci-test/mechanical-deads/${day}/${release}/"

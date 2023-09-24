@@ -45,4 +45,4 @@ gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-de
 gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver -- ./install.sh
 gcloud compute ssh --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver -- ./run-main.sh ${release}
 
-gcloud compute instances delete --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver
+gcloud compute instances delete --project=openshift-gce-devel --zone=us-east1-c mechanical-deads-driver --quiet

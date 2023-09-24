@@ -28,7 +28,7 @@ from functools import cached_property
 pandas.options.compute.use_numexpr = True
 
 
-def prowjob_url(row):
+def get_prowjob_url(row):
     return row['prowjob_url']
 
 class Mode(Enum):
@@ -563,7 +563,7 @@ LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
-# LIMIT_TEST_ID_SUFFIXES = ['9d46f2845cf09db01147b356db9bfe0d']
+# LIMIT_TEST_ID_SUFFIXES = ['9954db218dbe9650aeab680137483579']
 
 
 def process_queue(input_queue, commits_ordinals):
@@ -573,15 +573,23 @@ def process_queue(input_queue, commits_ordinals):
         print(f'Finished {name}')
 
 
-def analyze_test_id(name_group_commits):
+def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', 'arch', 'platform', 'test_id')):
     name_group, commits_ordinals = name_group_commits
     name, test_id_group = name_group
-    grouped_by_nurp = test_id_group.groupby(['network', 'upgrade', 'arch', 'platform', 'test_id'], sort=False)
-    # grouped_by_nurp = test_id_group.groupby(['platform', 'test_id'], sort=False)
-    for name, nurp_group in grouped_by_nurp:
+    grouped_by_facets = test_id_group.groupby(list(grouping_facets), sort=False)
+    for name, facets_group in grouped_by_facets:
         # print(f'Processing {name}')
 
-        failures_df = nurp_group[(nurp_group['success_val'] == 0) & (nurp_group['flake_count'] == 0)]
+        first_row = facets_group.iloc[0]
+        test_name = first_row['test_name']
+        network = first_row['network']
+        upgrade = first_row['upgrade']
+        arch = first_row['arch']
+        platform = first_row['platform']
+        test_id = first_row['test_id']
+        grouping_name = '__'.join(name)
+
+        failures_df = facets_group[(facets_group['success_val'] == 0) & (facets_group['flake_count'] == 0)]
         if len(failures_df.index) < 4:
             # Extremely few failures. Ignore this nurp.
             continue
@@ -593,16 +601,7 @@ def analyze_test_id(name_group_commits):
 
         all_releases: OrderedDict[ReleaseName, ReleasePayload] = OrderedDict()
 
-        first_row = nurp_group.iloc[0]
-        test_name = first_row['test_name']
-        network = first_row['network']
-        upgrade = first_row['upgrade']
-        arch = first_row['arch']
-        platform = first_row['platform']
-        test_id = first_row['test_id']
-        qtest_id = f"{network}_{upgrade}_{arch}_{platform}_{test_id}"
-
-        for t in nurp_group.itertuples():
+        for t in facets_group.itertuples():
 
             source_locations = t.source_locations
             commits = list(t.commits)
@@ -648,7 +647,7 @@ def analyze_test_id(name_group_commits):
                     linked_commits[source_location] = commit_to_update
 
         # Make a row for each test result against each commit.
-        flattened_nurp_group = nurp_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
+        flattened_nurp_group = facets_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
         ordered_commits = list(dict.fromkeys(ordered_commits))  # fast way to remove dupes while preserving order: https://stackoverflow.com/a/17016257
         flattened_nurp_group['commits'] = pandas.Categorical(flattened_nurp_group['commits'], ordered_commits)  # When subsequently sorted, this will sort the entries by their location in the ordered_commits
 
@@ -723,9 +722,9 @@ def analyze_test_id(name_group_commits):
             continue
 
         output_base.mkdir(parents=True, exist_ok=True)
-        output_path = output_base.joinpath(f'{qtest_id}.html')
+        output_path = output_base.joinpath(f'{grouping_name}.html')
 
-        release_info = nurp_group.sort_values(by=['release_created'], ascending=[True])
+        release_info = facets_group.sort_values(by=['release_created'], ascending=[True])
 
         unchanged_source_locations: Set[str] = set()
 
@@ -756,7 +755,7 @@ def analyze_test_id(name_group_commits):
         with a.html():
             with a.head():
                 a.meta(charset='utf-8')
-                a.title(_t=qtest_id)
+                a.title(_t=grouping_name)
                 with a.style():
                     a('.rb { width: inherit; height: 10px; border: 1px solid #888; box-sizing: border-box;}')
                     a('.rb-unknown { border: 0px solid #888; background-color: #eee;}')  # Used for commits which do not have a commit before them; thus no information to make regression determination.
@@ -841,17 +840,21 @@ th:hover::after {
                 with a.h3():
                     a(f'Test: {test_name} ({test_id})')
 
-                with a.h4():
-                    a(f'Upgrade: {upgrade}')
+                if 'upgrade' in grouping_facets:
+                    with a.h4():
+                        a(f'Upgrade: {upgrade}')
 
-                with a.h4():
-                    a(f'Platform: {platform}')
+                if 'platform' in grouping_facets:
+                    with a.h4():
+                        a(f'Platform: {platform}')
 
-                with a.h4():
-                    a(f'Network: {network}')
+                if 'network' in grouping_facets:
+                    with a.h4():
+                        a(f'Network: {network}')
 
-                with a.h4():
-                    a(f'Arch: {arch}')
+                if 'arch' in grouping_facets:
+                    with a.h4():
+                        a(f'Arch: {arch}')
 
                 for release_stream in (ReleasePayloadStreams.CI_PAYLOAD, ReleasePayloadStreams.NIGHTLY_PAYLOAD):
                     z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
@@ -866,6 +869,7 @@ th:hover::after {
                             continue
 
                         if not source_locations:
+                            # If we have not populated source locations for this stream yet, do so.
                             sorted_source_locations = sorted(list(t.source_locations))
                             source_locations.update({sl: True for sl in sorted_source_locations})
                             unchanged_source_locations.update(sorted_source_locations)  # Assume every source location does not have more than one commit until proven later.
@@ -936,6 +940,16 @@ th:hover::after {
                                 a.td(_t=repo_name)
                                 for z_entry in z.values():
                                     fe10, msg, c = z_entry[source_location]
+
+                                    if not c:
+                                        # No sha was described in oc adm release info for this component.
+                                        # This can happen with CI jobs which formulate payloads based on branch
+                                        # names. The test result against this payload are of interest (the
+                                        # code that was tested in certainly merged), but we don't know the
+                                        # exact commits in the payload at the time.
+                                        a.td(title='Payload did not specify commit', _t='?')
+                                        continue
+
                                     commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
                                     with a.td(title=msg):
                                         with a.a(href=f'#{c.commit_id}'):
@@ -1034,38 +1048,6 @@ th:hover::after {
                                         release_name = list(c.release_streams[ReleasePayloadStreams.CI_PAYLOAD].keys())[0]
                                         a.a(href=f'#{release_name}', _t=release_name)
 
-                            def render_test_run(row):
-                                for _ in range(row['flake_count']):
-                                    a.a(href=prowjob_url(row), klass='testr flake', _t='f', target="_blank")
-                                if row['success_val'] > 0:
-                                    a.a(href=prowjob_url(row), klass='testr success', _t='S', target="_blank")
-                                elif row['flake_count'] == 0:
-                                    a.a(href=prowjob_url(row), klass='testr failure', _t='F', target="_blank")
-
-                            if c.fe10 >= 0.90 or c.fe10 <= -0.90:
-                                with a.tr():
-                                    a.td(_t='Test Runs (all)')
-                                    with a.td(style='font-family: monospace; text-align: left;'):
-                                        test_run_count = 0
-                                        for _, row in c.tests_against_this_commit.iterrows():
-                                            render_test_run(row)
-                                            test_run_count += 1
-                                            if test_run_count % 20 == 0:
-                                                a.br()
-
-                                for stream in ReleasePayloadStreams:
-                                    with a.tr():
-                                        a.td(_t=f'Test Runs ({stream.value})')
-                                        with a.td(style='font-family: monospace; text-align: left;'):
-                                            test_run_count = 0
-                                            for _, row in c.tests_against_this_commit.iterrows():
-                                                if ReleasePayloadStreams.get_stream(row['release_name']) is not stream:
-                                                    continue
-                                                render_test_run(row)
-                                                test_run_count += 1
-                                                if test_run_count % 20 == 0:
-                                                    a.br()
-
                         with a.table(klass='styled-table'):
                             with a.tr():
                                 a.th(_t='Metric')
@@ -1079,6 +1061,75 @@ th:hover::after {
                                     a.td(_t=str(c.fe(window_size)))
                                     a.td(_t=str(c.behind_outcome(window_size)))
                                     a.td(_t=str(c.ahead_outcome_best(window_size)))
+
+                        if c.fe10 >= 0.90 or c.fe10 <= -0.90:
+                            with a.table(klass='styled-table'):
+
+                                with a.tr():
+                                    a.th(_t='Test Type')
+                                    a.th(_t='Before Commit (Up to 30)')
+                                    a.th(_t='After Commit (Up to 30)')
+
+                                def render_commit_results(test_runs, only_in_stream: Optional[ReleasePayloadStreams] = None, only_in_prowjob_name: Optional[str] = None):
+                                    test_run_count = 0
+                                    prowjob_url_successes: OrderedDict[str, int] = OrderedDict()
+                                    prowjob_url_failures: OrderedDict[str, int] = OrderedDict()
+                                    prowjob_url_flakes: OrderedDict[str, int] = OrderedDict()
+                                    for _, row in test_runs.iterrows():
+                                        if only_in_stream and ReleasePayloadStreams.get_stream(row['release_name']) is not only_in_stream:
+                                            continue
+                                        if only_in_prowjob_name and row['prowjob_name'] != only_in_prowjob_name:
+                                            continue
+                                        prowjob_url = get_prowjob_url(row)
+                                        prowjob_url_successes[prowjob_url] = prowjob_url_successes.get(prowjob_url, 0) + row['success_val']
+                                        prowjob_url_flakes[prowjob_url] = prowjob_url_flakes.get(prowjob_url, 0) + row['flake_count']
+                                        prowjob_url_failures[prowjob_url] = prowjob_url_failures.get(prowjob_url, 0) + (1 - row['success_val']) - row['flake_count']
+
+                                    for prowjob_url in prowjob_url_successes.keys():
+                                        for _ in range(prowjob_url_successes[prowjob_url]):
+                                            a.a(href=prowjob_url, klass='testr success', _t='S', target="_blank")
+                                        for _ in range(prowjob_url_flakes[prowjob_url]):
+                                            a.a(href=prowjob_url, klass='testr flake', _t='f', target="_blank")
+                                        for _ in range(max(prowjob_url_failures[prowjob_url], 0)):
+                                            a.a(href=prowjob_url, klass='testr failure', _t='F', target="_blank")
+                                        test_run_count += 1
+                                        if test_run_count % 20 == 0:
+                                            a.br()
+
+                                behind_test_results = c.behind(30)
+                                ahead_test_results = c.ahead(30)
+
+                                prowjob_names: Set[str] = set()
+                                for _, row in behind_test_results.iterrows():
+                                    prowjob_names.add(row['prowjob_name'])
+
+                                for _, row in ahead_test_results.iterrows():
+                                    prowjob_names.add(row['prowjob_name'])
+
+                                with a.tr():
+                                    a.td(_t='*')
+                                    with a.td(style='font-family: monospace; text-align: left; vertical-align: top;'):
+                                        render_commit_results(behind_test_results)
+                                    with a.td(style='font-family: monospace; text-align: left;  vertical-align: top;'):
+                                        render_commit_results(ahead_test_results)
+
+                                for stream in ReleasePayloadStreams:
+                                    with a.tr():
+                                        a.td(_t=f'{stream.value}')
+                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                            render_commit_results(behind_test_results, only_in_stream=stream)
+
+                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                            render_commit_results(ahead_test_results, only_in_stream=stream)
+
+                                for prowjob_name in prowjob_names:
+                                    with a.tr():
+                                        a.td(_t=f'{prowjob_name}')
+                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                            render_commit_results(behind_test_results, only_in_prowjob_name=prowjob_name)
+
+                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                            render_commit_results(ahead_test_results, only_in_prowjob_name=prowjob_name)
 
                         a.br()
                         a.br()
@@ -1109,13 +1160,20 @@ th:hover::after {
         with output_path.open(mode='w+') as f:
             f.write(str(a))
 
+        # There was a regression for this test_id, so if we are grouping by all facets
+        # in this invocation, analyze the test again, but only using two facets.
+        if len(grouping_facets) > 2:
+            analyze_test_id(name_group_commits, grouping_facets=('network', 'test_id'))
+            analyze_test_id(name_group_commits, grouping_facets=('upgrade', 'test_id'))
+            analyze_test_id(name_group_commits, grouping_facets=('platform', 'test_id'))
+            analyze_test_id(name_group_commits, grouping_facets=('arch', 'test_id'))
+
 
 @click.command()
-@click.option('-r', '--release', help='OpenShift release to analyze (e.g. "4.15")')
+@click.option('-r', '--release', required=True, help='OpenShift release to analyze (e.g. "4.15")')
 def cli(release):
     scan_period_days = 14  # days
     before_datetime = datetime.datetime.utcnow()
-    # TODO: REMOVE fixed date after testing
     # before_datetime = datetime.datetime(2023, 8, 1, 0, 0)  # There was a regression for GCP and Azure on 7/20
     # before_datetime = datetime.datetime(2023, 7, 24, 4, 10, 0)  # This is a time shortly before the first test results including the revert to the Azure regression.
     after_datetime = before_datetime - datetime.timedelta(days=scan_period_days)
@@ -1320,7 +1378,8 @@ def cli(release):
                         {suffix_test} 
                         AND test_name NOT LIKE "%disruption%" 
                         AND platform LIKE "{LIMIT_PLATFORM}" 
-                        AND upgrade LIKE "{LIMIT_UPGRADE}" 
+                        AND upgrade LIKE "{LIMIT_UPGRADE}"
+                        AND jobs.repo != "release"  # Ignore rehearsals 
             )
     
             SELECT  *
