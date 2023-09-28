@@ -577,9 +577,15 @@ def process_queue(input_queue, commits_ordinals):
 def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', 'arch', 'platform', 'test_id')):
     name_group, commits_ordinals = name_group_commits
     name, test_id_group = name_group
-    grouped_by_facets = test_id_group.groupby(list(grouping_facets), sort=False)
+    test_id = test_id_group.iloc[0]['test_id']
+    if len(grouping_facets) == 1:
+        # only by test_id
+        grouped_by_facets = [([test_id], test_id_group)]
+    else:
+        grouped_by_facets = test_id_group.groupby(list(grouping_facets), sort=False)
+
     for name, facets_group in grouped_by_facets:
-        # print(f'Processing {name}')
+        # print(f'Processing group {name}')
 
         first_row = facets_group.iloc[0]
         test_name = first_row['test_name']
