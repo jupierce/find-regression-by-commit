@@ -560,10 +560,11 @@ LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 
 # LIMIT_TEST_ID_SUFFIXES = [list('012345678'), list('90abcdef')]  # Process in two large groups
-LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
+# LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
-# LIMIT_TEST_ID_SUFFIXES = ['9954db218dbe9650aeab680137483579']
+LIMIT_TEST_ID_SUFFIXES = ['5f57267ca12f1857564c93504016c4e3']
+
 
 
 def process_queue(input_queue, commits_ordinals):
@@ -720,9 +721,6 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
         else:
             # Don't bother generating a report
             continue
-
-        output_base.mkdir(parents=True, exist_ok=True)
-        output_path = output_base.joinpath(f'{grouping_name}.html')
 
         release_info = facets_group.sort_values(by=['release_created'], ascending=[True])
 
@@ -1065,11 +1063,6 @@ th:hover::after {
                         if c.fe10 >= 0.90 or c.fe10 <= -0.90:
                             with a.table(klass='styled-table'):
 
-                                with a.tr():
-                                    a.th(_t='Test Type')
-                                    a.th(_t='Before Commit (Up to 30)')
-                                    a.th(_t='After Commit (Up to 30)')
-
                                 def render_commit_results(test_runs, only_in_stream: Optional[ReleasePayloadStreams] = None, only_in_prowjob_name: Optional[str] = None):
                                     test_run_count = 0
                                     prowjob_url_successes: OrderedDict[str, int] = OrderedDict()
@@ -1096,6 +1089,11 @@ th:hover::after {
                                         if test_run_count % 20 == 0:
                                             a.br()
 
+                                with a.tr():
+                                    a.th(_t='Test Type')
+                                    a.th(_t='Before Commit (Up to 30)')
+                                    a.th(_t='After Commit (Up to 30)')
+
                                 behind_test_results = c.behind(30)
                                 ahead_test_results = c.ahead(30)
 
@@ -1121,6 +1119,11 @@ th:hover::after {
 
                                         with a.td(style='font-family: monospace; text-align: left;'):
                                             render_commit_results(ahead_test_results, only_in_stream=stream)
+
+                                with a.tr():
+                                    a.th(_t='Prowjobs')
+                                    a.th(_t='Before Commit (Up to 30)')
+                                    a.th(_t='After Commit (Up to 30)')
 
                                 for prowjob_name in prowjob_names:
                                     with a.tr():
@@ -1157,16 +1160,24 @@ th:hover::after {
                                     a.td(_t=str(c.behind_outcome(10)))
                                     a.td(_t=str(c.ahead_outcome_best(10)))
 
+        output_base.mkdir(parents=True, exist_ok=True)
+        facets_path = output_base.joinpath('by_' + '_'.join(grouping_facets))
+        facets_path.mkdir(parents=True, exist_ok=True)
+        output_path = facets_path.joinpath(f'{grouping_name}.html')
+
         with output_path.open(mode='w+') as f:
             f.write(str(a))
 
         # There was a regression for this test_id, so if we are grouping by all facets
-        # in this invocation, analyze the test again, but only using two facets.
+        # in this invocation, analyze the test again, but only using two facets. Also
+        # run just for the test_id in isolation in case it is not influenced by
+        # environment or configuration.
         if len(grouping_facets) > 2:
             analyze_test_id(name_group_commits, grouping_facets=('network', 'test_id'))
             analyze_test_id(name_group_commits, grouping_facets=('upgrade', 'test_id'))
             analyze_test_id(name_group_commits, grouping_facets=('platform', 'test_id'))
             analyze_test_id(name_group_commits, grouping_facets=('arch', 'test_id'))
+            analyze_test_id(name_group_commits, grouping_facets=('test_id',))
 
 
 @click.command()
@@ -1345,7 +1356,7 @@ def cli(release):
                         AND network LIKE "{LIMIT_NETWORK}"
                         AND junit.modified_time {scan_period}
                         {suffix_test}
-                        AND test_name NOT LIKE "%disruption%"
+                        # AND test_name NOT LIKE "%disruption%"
                         AND platform LIKE "{LIMIT_PLATFORM}" 
                         AND upgrade LIKE "{LIMIT_UPGRADE}" 
                 UNION ALL    
@@ -1376,7 +1387,7 @@ def cli(release):
                         AND network LIKE "{LIMIT_NETWORK}"
                         AND junit_pr.modified_time {scan_period}
                         {suffix_test} 
-                        AND test_name NOT LIKE "%disruption%" 
+                        # AND test_name NOT LIKE "%disruption%" 
                         AND platform LIKE "{LIMIT_PLATFORM}" 
                         AND upgrade LIKE "{LIMIT_UPGRADE}"
                         AND jobs.repo != "release"  # Ignore rehearsals 
