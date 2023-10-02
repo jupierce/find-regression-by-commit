@@ -560,11 +560,10 @@ LIMIT_PLATFORM = '%'
 LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 
 # LIMIT_TEST_ID_SUFFIXES = [list('012345678'), list('90abcdef')]  # Process in two large groups
-# LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
+LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
-LIMIT_TEST_ID_SUFFIXES = ['5f57267ca12f1857564c93504016c4e3']
-
+# LIMIT_TEST_ID_SUFFIXES = ['0cb1bb27e418491b1ffdacab58c5c8c0']
 
 
 def process_queue(input_queue, commits_ordinals):
@@ -584,6 +583,7 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
     else:
         grouped_by_facets = test_id_group.groupby(list(grouping_facets), sort=False)
 
+    regressed_groups = 0
     for name, facets_group in grouped_by_facets:
         # print(f'Processing group {name}')
 
@@ -598,7 +598,7 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
 
         failures_df = facets_group[(facets_group['success_val'] == 0) & (facets_group['flake_count'] == 0)]
         if len(failures_df.index) < 4:
-            # Extremely few failures. Ignore this nurp.
+            # Extremely few failures. Ignore this grouping.
             continue
 
         # As we visit each test, keep track of the commits we see in the payloads in the order
@@ -653,7 +653,7 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
                     linked_commits[source_location].child = commit_to_update
                     linked_commits[source_location] = commit_to_update
 
-        # Make a row for each test result against each commit.
+        # Make a new dataframe which has a row for each test result against each commit included in the tested payload.
         flattened_nurp_group = facets_group.drop('source_locations', axis=1).explode('commits')  # pandas cannot drop duplicates with a column containing arrays. We don't need source locations in longer, so drop it.
         ordered_commits = list(dict.fromkeys(ordered_commits))  # fast way to remove dupes while preserving order: https://stackoverflow.com/a/17016257
         flattened_nurp_group['commits'] = pandas.Categorical(flattened_nurp_group['commits'], ordered_commits)  # When subsequently sorted, this will sort the entries by their location in the ordered_commits
@@ -663,7 +663,7 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
 
         # We analyze test results on a repo by repo basis. For efficiency, we groupby
         # source_location. This means sorting, searching, etc, in subsequent methods
-        # will only have to deal with relatively small groups of data.
+        # will only have to deal with relatively small groups of repo specific data.
         flattened_groups_by_source_location = flattened_nurp_group.groupby(by='source_locations', sort=False)
 
         # We now have test results in groups. Each group is all test results for commits in a given
@@ -724,6 +724,7 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
             output_base = analysis_path.joinpath('unresolved')
         elif resolved_regression:
             output_base = analysis_path.joinpath('resolved')
+            regressed_groups += 1
         else:
             # Don't bother generating a report
             continue
@@ -842,7 +843,10 @@ th:hover::after {
                     ''')
             with a.body():
                 with a.h3():
-                    a(f'Test: {test_name} ({test_id})')
+                    a(f'Test Name: {test_name}')
+
+                with a.h4():
+                    a(f'Test Id: {test_id}')
 
                 if 'upgrade' in grouping_facets:
                     with a.h4():
@@ -917,59 +921,66 @@ th:hover::after {
 
                         z[t.release_name] = z_entry
 
-                    if len(z) > 0:
+                    a.br()
+                    with a.h4():
+                        a(f'Release Controller Stream: {release_stream.value}')
+                    if len(z) == 0:
+                        a.span(_t=f"No payload in this release controller stream was found to have run this test in this specific environment and configuration.")
+                    else:
                         release_stream_prefix = ReleasePayloadStreams.split(list(z.keys())[0])[0]  # prefix of first release in results; this should be the same for all other releases in the results.
-                        a.br()
-                        with a.h4():
-                            a(f'Release Stream: {release_stream_prefix}')
+                        a.span(_t=f"Payloads in the {release_stream_prefix} release controller stream which ran this test in this specific environment & configuration are listed horizontally. Repositories which experienced change across those payload tests (over the analysis window) are listed vertically.")
 
-                    with a.table(klass="results"):
-                        with a.tr():
-                            a.th(_t='source')
-                            for release_name in z.keys():
-                                with a.th(klass='release-name'):
-                                    with a.div():
-                                        release_name_suffix = ReleasePayloadStreams.split(release_name)[1]
-                                        with a.a(href=f'#{release_name}'):
-                                            a.span(_t=release_name_suffix)
-
-                        commit_encountered_counts: Dict[str, int] = dict()
-
-                        commits_introduced_during_window = 0
-                        for source_location in source_locations.keys():
-                            if source_location in unchanged_source_locations:
-                                continue
+                        with a.table(klass="results"):
                             with a.tr():
-                                repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
-                                a.td(_t=repo_name)
-                                for z_entry in z.values():
-                                    fe10, msg, c = z_entry[source_location]
+                                a.th(_t='source')
+                                for release_name in z.keys():
+                                    with a.th(klass='release-name'):
+                                        with a.div():
+                                            release_name_suffix = ReleasePayloadStreams.split(release_name)[1]
+                                            with a.a(href=f'#{release_name}'):
+                                                a.span(_t=release_name_suffix)
 
-                                    if not c:
-                                        # No sha was described in oc adm release info for this component.
-                                        # This can happen with CI jobs which formulate payloads based on branch
-                                        # names. The test result against this payload are of interest (the
-                                        # code that was tested in certainly merged), but we don't know the
-                                        # exact commits in the payload at the time.
-                                        a.td(title='Payload did not specify commit', _t='?')
-                                        continue
+                            commit_encountered_counts: Dict[str, int] = dict()
 
-                                    commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
-                                    with a.td(title=msg):
-                                        with a.a(href=f'#{c.commit_id}'):
-                                            classes = 'rb'
-                                            style = ''
-                                            if c.parent is None:
-                                                classes += ' rb-unknown'
-                                            elif commit_encountered_count == 0:
-                                                classes += ' rb-new'
-                                                style = f'background-color:{fe10_color(fe10)};'
-                                                commits_introduced_during_window += 1
-                                            elif commit_encountered_count == 1 or fe10 < 0.0:
-                                                style = f'background-color:{fe10_color(fe10)};'
-                                            a.div(klass=classes, style=style)
-                                    commit_encountered_count += 1
-                                    commit_encountered_counts[c.commit_id] = commit_encountered_count
+                            commits_introduced_during_window = 0
+                            for source_location in source_locations.keys():
+                                if source_location in unchanged_source_locations:
+                                    continue
+                                with a.tr():
+                                    repo_name = source_location.split('/')[-1] or '__'  # If no repo, use _ for first and second letter
+                                    a.td(_t=repo_name)
+                                    for z_entry in z.values():
+                                        fe10, msg, c = z_entry[source_location]
+
+                                        if not c:
+                                            # No sha was described in oc adm release info for this component.
+                                            # This can happen with CI jobs which formulate payloads based on branch
+                                            # names. The test result against this payload are of interest (the
+                                            # code that was tested in certainly merged), but we don't know the
+                                            # exact commits in the payload at the time.
+                                            a.td(title='Payload did not specify commit', _t='?')
+                                            continue
+
+                                        commit_encountered_count = commit_encountered_counts.get(c.commit_id, 0)
+
+                                        classes = 'rb'
+                                        style = ''
+                                        if c.parent is None:
+                                            classes += ' rb-unknown'
+                                            msg += f'\nNo commits before this one available for comparison'
+                                        elif commit_encountered_count == 0:
+                                            classes += ' rb-new'
+                                            style = f'background-color:{fe10_color(fe10)};'
+                                            commits_introduced_during_window += 1
+                                            msg += f'\nFirst occurrence of this commit in the release stream'
+                                        elif commit_encountered_count == 1 or fe10 < 0.0:
+                                            style = f'background-color:{fe10_color(fe10)};'
+
+                                        with a.td(title=msg):
+                                            with a.a(href=f'#{c.commit_id}'):
+                                                a.div(klass=classes, style=style)
+                                        commit_encountered_count += 1
+                                        commit_encountered_counts[c.commit_id] = commit_encountered_count
 
                 a.h2(_t='Unresolved Regressions')
                 if unresolved_regression:
@@ -1027,13 +1038,13 @@ th:hover::after {
                                             a.a(href=f'#{resolution_outcomes.commit_id}', _t=f'{resolution_outcomes.commit_id}')
 
                             with a.tr():
-                                a.td(_t='Parent')
+                                a.td(_t='Next Tested Commit')
                                 with a.td():
                                     if c.get_parent_commit_id():
                                         a.a(href=f'#{c.get_parent_commit_id()}', _t=c.get_parent_commit_id())
 
                             with a.tr():
-                                a.td(_t='Child')
+                                a.td(_t='Previous Tested Commit')
                                 with a.td():
                                     if c.get_child_commit_id():
                                         a.a(href=f'#{c.get_child_commit_id()}', _t=c.get_child_commit_id())
@@ -1168,22 +1179,28 @@ th:hover::after {
 
         output_base.mkdir(parents=True, exist_ok=True)
         facets_path = output_base.joinpath('by_' + '_'.join(grouping_facets))
+
+        if len(grouping_facets) > 2:
+            facets_path = facets_path.joinpath(platform)
+
         facets_path.mkdir(parents=True, exist_ok=True)
+
         output_path = facets_path.joinpath(f'{grouping_name}.html')
 
         with output_path.open(mode='w+') as f:
             f.write(str(a))
 
-        # There was a regression for this test_id, so if we are grouping by all facets
-        # in this invocation, analyze the test again, but only using two facets. Also
-        # run just for the test_id in isolation in case it is not influenced by
-        # environment or configuration.
-        if len(grouping_facets) > 2:
-            analyze_test_id(name_group_commits, grouping_facets=('network', 'test_id'))
-            analyze_test_id(name_group_commits, grouping_facets=('upgrade', 'test_id'))
-            analyze_test_id(name_group_commits, grouping_facets=('platform', 'test_id'))
-            analyze_test_id(name_group_commits, grouping_facets=('arch', 'test_id'))
-            analyze_test_id(name_group_commits, grouping_facets=('test_id',))
+    # There was a regression for this test_id, so if we are grouping by all facets
+    # in this invocation, analyze the test again, but only using two facets. Also
+    # run just for the test_id in isolation in case it is not influenced by
+    # environment or configuration.
+    if len(grouping_facets) > 2 and regressed_groups > 0:
+        analyze_test_id(name_group_commits, grouping_facets=('prowjob_name', 'test_id'))
+        analyze_test_id(name_group_commits, grouping_facets=('network', 'test_id'))
+        analyze_test_id(name_group_commits, grouping_facets=('upgrade', 'test_id'))
+        analyze_test_id(name_group_commits, grouping_facets=('platform', 'test_id'))
+        analyze_test_id(name_group_commits, grouping_facets=('arch', 'test_id'))
+        analyze_test_id(name_group_commits, grouping_facets=('test_id',))
 
 
 @click.command()
@@ -1275,10 +1292,9 @@ def cli(release):
         AND release_created {scan_period}
     '''
 
-    print('Finding commits tested by non-pr release payloads')
     commits_tested_by_non_pr_payloads_df = main_client.query(query_commits_tested_by_non_pr_payloads).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
     commits_tested_by_non_pr_payloads = commits_tested_by_non_pr_payloads_df['commit'].tolist()
-    print(f'Found {len(commits_tested_by_non_pr_payloads)} of them')
+    print(f'Found {len(commits_tested_by_non_pr_payloads)} commits tested by non-PR release payloads during the analysis window across all tests')
 
     # Construct a definitive set including all commits that ultimately merged during
     # our observation period.
