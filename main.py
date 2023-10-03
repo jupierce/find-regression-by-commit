@@ -563,7 +563,7 @@ LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
-# LIMIT_TEST_ID_SUFFIXES = ['0cb1bb27e418491b1ffdacab58c5c8c0']
+# LIMIT_TEST_ID_SUFFIXES = ['99ebc8090424665613975d5c82db68e6']
 
 
 def process_queue(input_queue, commits_ordinals):
@@ -736,9 +736,9 @@ def analyze_test_id(name_group_commits, grouping_facets=('network', 'upgrade', '
         def fe10_color(fe10):
             if math.isnan(fe10):
                 # Indicate visually that there is no semantic value to the
-                # record since there is no commit prior to this commit in the
+                # record since there is no testing prior to this commit in the
                 # test records and thus nothing to compare against.
-                return '#888'
+                return '#eee'
             r = 0xff
             g = 0xff
             b = 0xff
@@ -863,6 +863,11 @@ th:hover::after {
                 if 'arch' in grouping_facets:
                     with a.h4():
                         a(f'Arch: {arch}')
+
+                if 'prowjob_name' in grouping_facets:
+                    prowjob_name = first_row['prowjob_name']
+                    with a.h4():
+                        a(f'ProwJob: {prowjob_name}')
 
                 for release_stream in (ReleasePayloadStreams.CI_PAYLOAD, ReleasePayloadStreams.NIGHTLY_PAYLOAD):
                     z: OrderedDict[str, OrderedDict[str, Tuple]] = OrderedDict()
@@ -1038,13 +1043,13 @@ th:hover::after {
                                             a.a(href=f'#{resolution_outcomes.commit_id}', _t=f'{resolution_outcomes.commit_id}')
 
                             with a.tr():
-                                a.td(_t='Next Tested Commit')
+                                a.td(_t='Previous Tested Commit')
                                 with a.td():
                                     if c.get_parent_commit_id():
                                         a.a(href=f'#{c.get_parent_commit_id()}', _t=c.get_parent_commit_id())
 
                             with a.tr():
-                                a.td(_t='Previous Tested Commit')
+                                a.td(_t='Next Tested Commit')
                                 with a.td():
                                     if c.get_child_commit_id():
                                         a.a(href=f'#{c.get_child_commit_id()}', _t=c.get_child_commit_id())
@@ -1368,8 +1373,8 @@ def cli(release):
                         source_locations,
                         release_name,
                         release_created,
-                        0 AS is_pr, 
-                        "N/A" as pr_sha,
+                        IF(pr_sha IS NULL, 0, 1) AS is_pr, 
+                        pr_sha,
                         jobs.prowjob_url as prowjob_url
                 FROM    `openshift-gce-devel.ci_analysis_us.junit` junit 
                         INNER JOIN payload_components ON junit.prowjob_build_id = payload_components.pjbi 
@@ -1434,6 +1439,14 @@ def cli(release):
             all_records.loc[
                 ((all_records['is_pr'] == 1) & (all_records['pr_sha'].isin(merged_commits))), 'is_pr'
             ] = 0
+
+        # There are some jobs that run with ci-op formulated release payloads which are triggered
+        # by periodics instead of by a pre-submit. In these cases, we don't have the pr_sha to figure
+        # out missing commit information for the payload. Filter ci-op formulated payloads if they
+        # do not have a pr_sha field.
+        all_records.loc[
+            ((all_records['pr_sha'].isnull()) & (all_records['release_name'].str.contains('.ci.test'))), 'is_pr'
+        ] = 1
 
         # Drop all records that were pre-merge tests containing untrusted commits.
         trusted_records = all_records[all_records['is_pr'] == 0]
