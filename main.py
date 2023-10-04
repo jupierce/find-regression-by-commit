@@ -563,7 +563,7 @@ LIMIT_UPGRADE = '%'  # 'upgrade-micro'
 LIMIT_TEST_ID_SUFFIXES = list('abcdef0123456789')  # Process in 16 groups
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>2X}' for r in range(0x100)]  # ids ending with two hex digits; useful for lower memory systems.
 # LIMIT_TEST_ID_SUFFIXES = [f'{r:0>3X}' for r in range(0x1000)]  # ids ending with three hex digits; even lower memory
-# LIMIT_TEST_ID_SUFFIXES = ['99ebc8090424665613975d5c82db68e6']
+# LIMIT_TEST_ID_SUFFIXES = ['19614a174d2343af986eedf21e5d8a9b']
 
 
 def process_queue(input_queue, commits_ordinals):
@@ -785,6 +785,10 @@ a.failure:link, a.failure:visited {
 }                    
 a.flake:link, a.flake:visited {
     color: gray;
+}
+a.direct:link {
+    text-decoration-line: underline;
+    text-decoration-style: double;
 }                    
 ''')
 
@@ -822,6 +826,12 @@ th:hover::after {
 .styled-table th,
 .styled-table td {
     padding: 12px 15px;
+}
+
+.testr {
+    font-family: monospace; 
+    text-align: left; 
+    vertical-align: top;
 }
 
 .styled-table tbody tr {
@@ -1090,6 +1100,7 @@ th:hover::after {
                                     prowjob_url_successes: OrderedDict[str, int] = OrderedDict()
                                     prowjob_url_failures: OrderedDict[str, int] = OrderedDict()
                                     prowjob_url_flakes: OrderedDict[str, int] = OrderedDict()
+                                    prowjob_url_direct_test: OrderedDict[str, bool] = OrderedDict()
                                     for _, row in test_runs.iterrows():
                                         if only_in_stream and ReleasePayloadStreams.get_stream(row['release_name']) is not only_in_stream:
                                             continue
@@ -1099,20 +1110,25 @@ th:hover::after {
                                         prowjob_url_successes[prowjob_url] = prowjob_url_successes.get(prowjob_url, 0) + row['success_val']
                                         prowjob_url_flakes[prowjob_url] = prowjob_url_flakes.get(prowjob_url, 0) + row['flake_count']
                                         prowjob_url_failures[prowjob_url] = prowjob_url_failures.get(prowjob_url, 0) + (1 - row['success_val']) - row['flake_count']
+                                        prowjob_url_direct_test[prowjob_url] = row['commits'] == c.commit_id
 
                                     for prowjob_url in prowjob_url_successes.keys():
+                                        klass_extra = ''
+                                        if prowjob_url_direct_test[prowjob_url]:
+                                            # This test was against this exact commit (and not a descendant).
+                                            klass_extra = 'direct'
                                         for _ in range(prowjob_url_successes[prowjob_url]):
-                                            a.a(href=prowjob_url, klass='testr success', _t='S', target="_blank")
+                                            a.a(href=prowjob_url, klass=f'success {klass_extra}', _t='S', target="_blank")
                                         for _ in range(prowjob_url_flakes[prowjob_url]):
-                                            a.a(href=prowjob_url, klass='testr flake', _t='f', target="_blank")
+                                            a.a(href=prowjob_url, klass=f'flake {klass_extra}', _t='f', target="_blank")
                                         for _ in range(max(prowjob_url_failures[prowjob_url], 0)):
-                                            a.a(href=prowjob_url, klass='testr failure', _t='F', target="_blank")
+                                            a.a(href=prowjob_url, klass=f'failure {klass_extra}', _t='F', target="_blank")
                                         test_run_count += 1
                                         if test_run_count % 20 == 0:
                                             a.br()
 
                                 with a.tr():
-                                    a.th(_t='Test Type')
+                                    a.th(_t='All Analyzed Tests')
                                     a.th(_t='Before Commit (Up to 30)')
                                     a.th(_t='After Commit (Up to 30)')
 
@@ -1128,32 +1144,37 @@ th:hover::after {
 
                                 with a.tr():
                                     a.td(_t='*')
-                                    with a.td(style='font-family: monospace; text-align: left; vertical-align: top;'):
+                                    with a.td(klass='testr'):
                                         render_commit_results(behind_test_results)
-                                    with a.td(style='font-family: monospace; text-align: left;  vertical-align: top;'):
+                                    with a.td(klass='testr'):
                                         render_commit_results(ahead_test_results)
+
+                                with a.tr():
+                                    a.th(_t='Tests by Stream')
+                                    a.th(_t='Before Commit (Up to 30)')
+                                    a.th(_t='After Commit (Up to 30)')
 
                                 for stream in ReleasePayloadStreams:
                                     with a.tr():
                                         a.td(_t=f'{stream.value}')
-                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                        with a.td(klass='testr'):
                                             render_commit_results(behind_test_results, only_in_stream=stream)
 
-                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                        with a.td(klass='testr'):
                                             render_commit_results(ahead_test_results, only_in_stream=stream)
 
                                 with a.tr():
-                                    a.th(_t='Prowjobs')
+                                    a.th(_t='Tests by ProwJob')
                                     a.th(_t='Before Commit (Up to 30)')
                                     a.th(_t='After Commit (Up to 30)')
 
                                 for prowjob_name in prowjob_names:
                                     with a.tr():
                                         a.td(_t=f'{prowjob_name}')
-                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                        with a.td(klass='testr'):
                                             render_commit_results(behind_test_results, only_in_prowjob_name=prowjob_name)
 
-                                        with a.td(style='font-family: monospace; text-align: left;'):
+                                        with a.td(klass='testr'):
                                             render_commit_results(ahead_test_results, only_in_prowjob_name=prowjob_name)
 
                         a.br()
