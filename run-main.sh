@@ -8,7 +8,7 @@ fi
 
 release="$1"
 
-./main.py --release="${release}"
+timeout 2.5h ./main.py --release="${release}"
 day="$(date +%F)"
 hour="$(date +"%H-%M-%S")"
 
