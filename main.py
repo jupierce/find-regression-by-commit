@@ -1096,12 +1096,13 @@ th:hover::after {
                             with a.table(klass='styled-table'):
 
                                 def render_commit_results(test_runs, only_in_stream: Optional[ReleasePayloadStreams] = None, only_in_prowjob_name: Optional[str] = None):
+                                    reverse_chrom_test_runs = test_runs[::-1]
                                     test_run_count = 0
                                     prowjob_url_successes: OrderedDict[str, int] = OrderedDict()
                                     prowjob_url_failures: OrderedDict[str, int] = OrderedDict()
                                     prowjob_url_flakes: OrderedDict[str, int] = OrderedDict()
                                     prowjob_url_direct_test: OrderedDict[str, bool] = OrderedDict()
-                                    for _, row in test_runs.iterrows():
+                                    for _, row in reverse_chrom_test_runs.iterrows():
                                         if only_in_stream and ReleasePayloadStreams.get_stream(row['release_name']) is not only_in_stream:
                                             continue
                                         if only_in_prowjob_name and row['prowjob_name'] != only_in_prowjob_name:
